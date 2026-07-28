@@ -35,12 +35,27 @@ pip install "infraredshift[jdbc]"
 
 Python 3.10+.
 
+**No executables are installed.** The wheel is pure Python (`py3-none-any`) and
+contains no `.exe`, `.dll` or compiled extension of any kind. Deliberately, it
+also installs no console-script shims — on Windows pip generates those as
+`.exe` files (the same mechanism behind `pip.exe`), drops them in a directory
+that is often not on `PATH`, and warns about it. On a locked-down laptop an
+unexplained `.exe` is a question you have to answer, so there are none.
+
+Everything runs as a module:
+
+```bash
+python -m analyzer                  # the desktop app
+python -m analyzer.loader           # the loader CLI
+python -m analyzer.ingest_redshift  # direct capture
+```
+
 ---
 
 ## First run
 
 ```bash
-infraredshift
+python -m analyzer
 ```
 
 The app opens on a local sign-in screen. **This is not a Redshift login** — it
@@ -95,7 +110,7 @@ immediately.
 **3. Load.** Use the Data Loader tab, or:
 
 ```bash
-infraredshift-loader refresh --days 7
+python -m analyzer.loader refresh --days 7
 ```
 
 The first load is the slow one. After that, loads are incremental.
@@ -128,9 +143,9 @@ expanded, which is usually more than the SQL suggests.
 
 | Command | Does |
 |---|---|
-| `infraredshift` | Open the desktop app |
-| `infraredshift-loader refresh --days 7` | Incremental capture |
-| `infraredshift-capture --external-tables` | Spectrum/external metadata (opt-in) |
+| `python -m analyzer` | Open the desktop app |
+| `python -m analyzer.loader refresh --days 7` | Incremental capture |
+| `python -m analyzer.ingest_redshift --external-tables` | Spectrum/external metadata (opt-in) |
 
 ### Large Spectrum catalogs
 

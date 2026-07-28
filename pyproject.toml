@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "infraredshift"
-version = "0.1.0"
+version = "0.1.1"
 description = "Amazon Redshift workload triage: captures SYS/SVV telemetry from producer and consumer clusters into local DuckDB, groups repeat query patterns, and ranks physical-design fixes by total time cost."
 readme = "README-PYPI.md"
 requires-python = ">=3.10"
@@ -78,10 +78,17 @@ all = [
   "JPype1>=1.5.0",
 ]
 
-[project.scripts]
-infraredshift = "analyzer.app:run"
-infraredshift-loader = "analyzer.loader.cli:main"
-infraredshift-capture = "analyzer.ingest_redshift:main"
+# No [project.scripts]. On Windows pip turns each console script into a
+# generated .exe shim (the same mechanism behind pip.exe), places them in a
+# directory that is often not on PATH, and warns about it. For a tool aimed at
+# locked-down corporate laptops, unexplained .exe files and a scary-looking pip
+# warning cost more than the convenience is worth.
+#
+# Every entry point is reachable as a module instead:
+#   python -m analyzer                     the desktop app
+#   python -m analyzer.loader              the loader CLI
+#   python -m analyzer.ingest_redshift     direct capture
+# The wheel stays pure Python (py3-none-any) with no binaries of any kind.
 
 [project.urls]
 Homepage = "https://github.com/lcapece/redshift#readme"
