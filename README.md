@@ -74,6 +74,32 @@ That means the same warehouse always produces the same answer, and every
 recommendation traces back to a number you can check in Redshift yourself. There
 is no confidence score to interpret and no hallucination to guard against.
 
+### The honest version: an AI API would make much of this easier
+
+Worth saying plainly, because anyone evaluating this will think it anyway:
+**most of what this application does would be simpler to build with access to
+an AI API.** "Are these two queries the same shape?" and "what sort key suits
+this workload?" are questions a good model answers well, in a fraction of the
+code.
+
+Every equivalence here had to be earned explicitly in the AST instead — this
+alias is irrelevant, that clause order is commutative, this generated suffix is
+run-scoped noise. A model would have absorbed those cases without being told.
+That is real engineering cost, and pretending otherwise would be dishonest.
+
+**This application exists for the situations where that option is not
+available.** Not because deterministic analysis is philosophically superior,
+but because for a great many institutions the AI route is closed — by policy,
+by regulator, by an unfinished data-governance review, or simply because nobody
+has signed off on sending production SQL to a third party yet. In those places
+the choice is not "AI tool versus this tool." It is "this tool versus a
+spreadsheet and a hunch."
+
+The deterministic approach does buy real things in exchange for the effort:
+reproducible results, an audit trail from every recommendation back to a number
+in your own cluster, and no confidence score to second-guess. But the reason it
+was built this way is the constraint, not the philosophy.
+
 If your organization later adopts AI tooling, nothing here blocks it. But
 Infraredshift will not be the reason your query corpus left the building.
 

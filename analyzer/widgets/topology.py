@@ -29,6 +29,24 @@ from ..topology import ClusterStatus, REQUIRED_DATASETS, TopologySnapshot, load_
 # labels are matched against them so users recognize each cluster.
 DISPLAY_LABELS = ("Producer", "Consumer", "Commercial", "FAR")
 
+_ESTATE_DESCRIPTION = (
+    "The Producer is the primary cluster; Consumer, Commercial, and FAR are its "
+    "siblings that read data off of it. All four are captured so their SQL patterns "
+    "can inform producer table designs and surface bad queries worth correcting. "
+    "Every cluster loads the identical datasets; the three database-dependent catalog "
+    "datasets (table information, view definitions, stored procedures) load cyclically "
+    "per database."
+)
+
+# One configured cluster is a supported setup, not half a missing estate.
+_SINGLE_CLUSTER_DESCRIPTION = (
+    "One cluster is configured, and it is captured as the producer. Everything "
+    "works the same way as a multi-cluster estate - the same grouping, heat map "
+    "and ranked fixes - there is simply no sibling to compare against. The three "
+    "database-dependent catalog datasets (table information, view definitions, "
+    "stored procedures) load cyclically per database."
+)
+
 # The three database-dependent catalog datasets that load cyclically
 # per database on every cluster.
 _CYCLICAL_TABLES = {"svv_table_info_all", "view_definitions", "procedure_definitions"}
@@ -69,6 +87,15 @@ def _assign_display_labels(
     Clusters beyond the four known labels are appended under their own name.
     """
     remaining = list(clusters)
+
+    # A single-cluster install is a first-class case, not a degraded estate.
+    # Showing "Producer" plus three empty Consumer/Commercial/FAR slots implies
+    # a topology that does not exist and reads as three failed loads. Show the
+    # one cluster under the name its own profile gives it.
+    if len(clusters) == 1:
+        only = clusters[0]
+        return [(only.friendly_name or "Producer", only)]
+
     assigned: dict[str, ClusterStatus | None] = {}
     producer = next((item for item in remaining if item.role == "producer"), None)
     if producer is not None:
@@ -228,16 +255,13 @@ class TopologyPage(QWidget):
         heading_row.addWidget(self._refresh)
         root.addLayout(heading_row)
 
-        description = QLabel(
-            "The Producer is the primary cluster; Consumer, Commercial, and FAR are its "
-            "siblings that read data off of it. All four are captured so their SQL patterns "
-            "can inform producer table designs and surface bad queries worth correcting. "
-            "Every cluster loads the identical datasets; the three database-dependent catalog "
-            "datasets (table information, view definitions, stored procedures) load cyclically "
-            "per database."
+        description = QLabel(_ESTATE_DESCRIPTION
         )
         description.setWordWrap(True)
         description.setObjectName("Caption")
+        # False until a snapshot arrives; the estate wording is the safe default.
+        self._single_cluster = False
+        self._description = description
         root.addWidget(description)
 
         selector_row = QHBoxLayout()
@@ -344,6 +368,12 @@ class TopologyPage(QWidget):
     def _on_snapshot(self, snapshot: TopologySnapshot) -> None:
         self._snapshot = snapshot
         self._labeled = _assign_display_labels(snapshot.clusters)
+        self._single_cluster = len(snapshot.clusters) == 1
+        self._description.setText(
+            _SINGLE_CLUSTER_DESCRIPTION
+            if self._single_cluster
+            else _ESTATE_DESCRIPTION
+        )
         self._path_label.setText(f"Local DuckDB: {snapshot.db_path or 'not selected'}")
 
         selected = max(0, self._selector.checkedId())
@@ -387,7 +417,14 @@ class TopologyPage(QWidget):
             )
             self._render_coverage(None)
             return
-        role = "Producer (primary)" if cluster.role == "producer" else "Reads from Producer"
+        # With one cluster there is nothing to be primary over, and "Reads from
+        # Producer" would be describing a relationship that does not exist.
+        if self._single_cluster:
+            role = "Single cluster"
+        elif cluster.role == "producer":
+            role = "Producer (primary)"
+        else:
+            role = "Reads from Producer"
         severity = _SEVERITY_TEXT.get(cluster.severity, "Incomplete")
         self._cluster_line.setText(
             f"{label} — {role} — namespace {cluster.namespace_id or 'MISSING'} — "
