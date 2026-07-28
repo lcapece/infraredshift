@@ -46,3 +46,61 @@ def _isolated_environment(tmp_path_factory):
     os.environ.clear()
     os.environ.update(saved)
     _clear_credential_session()
+
+
+@pytest.fixture(autouse=True)
+def _release_qt_widgets():
+    """Destroy leaked top-level Qt widgets after every test.
+
+    Most tests construct a page or a whole MainWindow and never delete it.
+    Python drops its reference but the C++ object survives, attached to the
+    QApplication, so a full-suite run accumulates hundreds of live widgets and
+    their native resources. Past a threshold Qt aborts the process outright -
+    which surfaced as an abort partway through the run with ZERO test
+    failures, at a different point each time, and looked like a flaky test
+    rather than resource exhaustion.
+
+    Deleting between tests keeps the count flat. deleteLater() alone is not
+    enough here: it needs an event loop turn to take effect, and the suite
+    does not always spin one.
+    """
+    yield
+    try:
+        from PySide6.QtWidgets import QApplication
+    except Exception:
+        return
+    from PySide6.QtCore import QThread
+
+    app = QApplication.instance()
+    if app is None:
+        return
+
+    # Stop worker threads FIRST. Several pages run analysis on a QThread whose
+    # signals land back on widgets; deleting a widget while its thread is still
+    # emitting is an access violation, not a leak. Order matters here - an
+    # earlier version of this fixture deleted first and crashed harder.
+    for thread in app.findChildren(QThread):
+        try:
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(2000)
+        except RuntimeError:
+            continue
+    for widget in list(app.topLevelWidgets()):
+        for thread in widget.findChildren(QThread):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(2000)
+            except RuntimeError:
+                continue
+    app.processEvents()
+
+    for widget in list(app.topLevelWidgets()):
+        try:
+            widget.close()
+            widget.deleteLater()
+        except RuntimeError:
+            # Already destroyed by the test itself.
+            continue
+    app.processEvents()
