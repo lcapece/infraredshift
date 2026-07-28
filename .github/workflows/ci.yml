@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [grok, main, master, "rescue/**", "feature/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r analyzer/requirements.txt
+          python -m pip install pytest
+      - name: Build single-file launchers from source
+        # The launchers are generated build output and are no longer committed.
+        # Rebuild them from analyzer/ source on every run so any test that
+        # loads a launcher sees a fresh, in-sync artifact (drift is now
+        # impossible by construction rather than by developer discipline).
+        run: |
+          python tools/build_text_py.py
+          python tools/build_fat_py.py
+          python tools/build_email_mailsafe.py
+      - name: Unit tests
+        run: python -m pytest tests -q --tb=short
+
+  # The client fleet is Windows-only, but a case-sensitive checkout is the
+  # only thing that catches wrong-case filenames (a tracked runner.py vs a
+  # generated Runner.py class of bug) before they break a fresh clone.
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install non-GUI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install duckdb pandas numpy sqlglot==26.33.0 rapidfuzz redshift-connector pytest
+      - name: Byte-compile everything on a case-sensitive filesystem
+        run: python -m compileall -q analyzer tools tests runner.py
+      - name: OS-neutral test subset (informational until proven stable)
+        # Loader/merge/store tests use no GUI. Flip continue-on-error off
+        # once this step has a green history.
+        continue-on-error: true
+        run: >-
+          python -m pytest
+          tests/test_merge.py tests/test_swap_guard.py tests/test_store_recovery.py
+          tests/test_launcher_sync.py redshift_decomposer/tests
+          -q --tb=short

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling scratch
+.pytest_cache/
+.codex_pytest_*/
+.pytest_tmp*/
+
+# Local state - never commit
+.env
+*.secrets
+auth.json
+settings.json
+
+# Warehouses. Sample fixtures under analyzer/samples are tracked deliberately.
+*.duckdb
+!analyzer/samples/*.duckdb
+
+# Generated delivery artifacts
+SEND-THIS-ONE/
+outputs/
+
+# Generated single-file launcher (rebuild: python tools/build_text_py.py)
+Infraredshift.txt
+Infraredshift.py
+redshift_analyzer_text.*
+runner.txt

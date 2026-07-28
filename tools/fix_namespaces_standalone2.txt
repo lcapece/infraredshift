@@ -1,0 +1,230 @@
+"""Repair placeholder consumer namespace ids in the Databa6ix DuckDB warehouse.
+
+Self-contained: no other files, no DuckDB CLI, no SQL script alongside it.
+
+    python FIX-NAMESPACES.py
+
+WHAT WENT WRONG
+    The three CONSUMER profiles were loaded while
+    redshift_cluster_profiles.json still held its template values, so every
+    consumer row was stored under the literal string
+    "REPLACE-CONSUMER-n-NAMESPACE-ID". The PRODUCER namespace is already
+    correct and is not touched.
+
+    THE DATA IS FINE. Only its namespace label is wrong. The analysis scope
+    filters on the real namespace, so those clusters show zero rows while
+    their data sits right there. This relabels in place: no Redshift
+    connection, no reload, so a busy cluster does not block the fix.
+
+WHAT IT DOES
+    1. Surveys every base table carrying namespace_id and prints what it finds.
+    2. Asks before writing anything.
+    3. Backs up the .duckdb file.
+    4. Applies all updates in ONE transaction, then re-surveys to confirm.
+
+Safe to run twice: once repaired there are no placeholders left to find.
+NULL and empty namespaces are never touched - their origin cluster is unknown,
+so any value written would be a guess.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import duckdb
+except ImportError:
+    sys.exit("duckdb is not installed.  Fix it with:   pip install duckdb")
+
+# --- edit this if your warehouse lives somewhere else ----------------------
+DB_PATH = Path(os.path.expandvars(r"%USERPROFILE%\RQP\data\redshift.duckdb"))
+
+# --- placeholder -> real namespace id --------------------------------------
+MAPPING = {
+    "REPLACE-CONSUMER-1-NAMESPACE-ID": ("Commercial Bank", "602d7b45-34f6-40ee-b69e-54c9e0cb5d96"),
+    "REPLACE-CONSUMER-2-NAMESPACE-ID": ("Consumer Bank", "4d44d131-c4df-41f0-8260-ec99d58419d7"),
+    "REPLACE-CONSUMER-3-NAMESPACE-ID": ("Finance & Risk", "201bbc47-5536-4caf-af86-3d8e827f90c9"),
+}
+
+
+def namespace_tables(con) -> list[str]:
+    """Base tables carrying namespace_id.
+
+    Views are excluded on purpose: they derive from these tables and follow
+    automatically, and updating a view would fail.
+    """
+    return [
+        row[0]
+        for row in con.execute(
+            """
+            SELECT c.table_name
+            FROM information_schema.columns c
+            JOIN information_schema.tables t
+              ON t.table_name = c.table_name
+             AND t.table_schema = c.table_schema
+            WHERE c.column_name = 'namespace_id'
+              AND c.table_schema = 'main'
+              AND t.table_type = 'BASE TABLE'
+            ORDER BY c.table_name
+            """
+        ).fetchall()
+    ]
+
+
+def survey(con, tables: list[str]) -> dict[str, int]:
+    """Row counts per namespace value across EVERY table.
+
+    Surveying one table would report "nothing to repair" while placeholders sat
+    in the other nineteen.
+    """
+    totals: dict[str, int] = {}
+    for table in tables:
+        try:
+            found = con.execute(
+                f'SELECT namespace_id, COUNT(*) FROM "{table}" GROUP BY 1'
+            ).fetchall()
+        except Exception:
+            continue  # table may be empty or mid-migration
+        for value, count in found:
+            key = (
+                "(null or empty)"
+                if value is None or not str(value).strip()
+                else str(value)
+            )
+            totals[key] = totals.get(key, 0) + int(count)
+    return totals
+
+
+def show(totals: dict[str, int]) -> None:
+    if not totals:
+        print("  (no namespace values found)")
+        return
+    width = max(len(key) for key in totals)
+    for value, count in sorted(totals.items(), key=lambda kv: -kv[1]):
+        length = 0 if value.startswith("(") else len(value)
+        flag = "   <-- PLACEHOLDER" if value.startswith("REPLACE-") else ""
+        print(f"  {value:<{width}}  {length:>3} chars  {count:>9,} rows{flag}")
+
+
+def main() -> int:
+    print("=" * 72)
+    print(" Namespace repair - Databa6ix warehouse")
+    print("=" * 72)
+    print(f" Database: {DB_PATH}\n")
+
+    if not DB_PATH.exists():
+        print(f"ERROR: database not found at {DB_PATH}")
+        print("Edit the DB_PATH line near the top of this script if yours differs.")
+        return 2
+
+    # Probe for a write lock up front. DuckDB permits many readers but only one
+    # writer, and a blocked write can wait indefinitely with no message - so
+    # without this check the script appears to hang after writing the backup.
+    try:
+        probe = duckdb.connect(str(DB_PATH), read_only=False)
+        probe.close()
+    except Exception as exc:
+        print("ERROR: the database is locked by another process.")
+        print("")
+        print(f"  {exc}")
+        print("")
+        print("Something still has redshift.duckdb open. Usually this is the")
+        print("Databa6ix app (even minimised), or a loader left running.")
+        print("")
+        print("  1. Close the Databa6ix app completely.")
+        print("  2. Check for leftovers:")
+        print('       tasklist | findstr /i "python pythonw DataBa6ix duckdb"')
+        print("  3. End any that appear, then run this script again.")
+        print("")
+        print("Nothing was changed.")
+        return 2
+
+    try:
+        con = duckdb.connect(str(DB_PATH), read_only=True)
+    except Exception as exc:
+        print(f"ERROR: cannot open the database: {exc}")
+        return 2
+
+    tables = namespace_tables(con)
+    print(f"Scanning {len(tables)} table(s) that carry namespace_id.\n")
+    print("BEFORE")
+    print("-" * 72)
+    totals = survey(con, tables)
+    show(totals)
+    con.close()
+
+    present = [value for value in MAPPING if value in totals]
+    if not present:
+        print("\nNo REPLACE-* placeholders found. Nothing for this script to repair.")
+        print("If clusters still show zero rows, check:")
+        print("  Settings -> Analysis cluster scope -> tick 'All loaded clusters'")
+        return 0
+
+    print(f"\n{len(present)} placeholder namespace(s) will be repaired:")
+    for value in present:
+        label, real = MAPPING[value]
+        print(f"  {value}")
+        print(f"      -> {real}   ({label}, {totals[value]:,} rows)")
+
+    print("\nNULL / empty namespaces are NOT touched: their origin cluster is")
+    print("unknown, so any value written would be a guess.")
+
+    answer = input("\nApply the repair? A backup is written first. [y/N] ").strip().lower()
+    if answer != "y":
+        print("Cancelled. Nothing was changed.")
+        return 0
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.pre-nsfix-{stamp}{DB_PATH.suffix}")
+    shutil.copy2(DB_PATH, backup_path)
+    print(f"\nBackup written: {backup_path}")
+
+    con = duckdb.connect(str(DB_PATH), read_only=False)
+    applied = 0
+    try:
+        con.execute("BEGIN TRANSACTION")
+        for placeholder in present:
+            _label, real = MAPPING[placeholder]
+            for table in tables:
+                con.execute(
+                    f'UPDATE "{table}" SET namespace_id = ? WHERE namespace_id = ?',
+                    [real, placeholder],
+                )
+                applied += 1
+        con.execute("COMMIT")
+    except Exception as exc:
+        con.execute("ROLLBACK")
+        print(f"\nFAILED - rolled back. The database was NOT modified.\n{exc}")
+        con.close()
+        return 1
+
+    print(f"Applied {applied} statement(s) across {len(tables)} table(s).\n")
+    print("AFTER")
+    print("-" * 72)
+    show(survey(con, tables))
+    con.close()
+
+    profiles = os.path.expandvars(r"%USERPROFILE%\RQP\redshift_cluster_profiles.json")
+    print("\n" + "=" * 72)
+    print(" DONE - two steps remain that this script cannot do")
+    print("=" * 72)
+    print(f"\n 1. Edit {profiles}")
+    print("    Replace the three consumer placeholders, or the NEXT load")
+    print("    re-creates them:\n")
+    for placeholder, (label, real) in MAPPING.items():
+        print(f"      {label:<16} {real}")
+    print("\n    Each must be exactly 36 characters. If a value is 72")
+    print("    characters it is the same UUID pasted twice - keep the first half.")
+    print("\n 2. In the app: Settings -> Analysis cluster scope")
+    print("    Tick 'All loaded clusters', or confirm the ticked namespaces")
+    print("    match the ids above. A stale scope still shows zero rows even")
+    print("    after the data is repaired.\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

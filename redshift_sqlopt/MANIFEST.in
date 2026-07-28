@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include NOTICE
+include CHANGELOG.md
+recursive-include tests *.py
+# Training material is research scaffolding for a future model-assisted
+# rewriter, not part of the installable package.
+prune training

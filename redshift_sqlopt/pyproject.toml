@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redshift-sqlopt"
+version = "0.1.0"
+description = "Evidence-driven Amazon Redshift query optimizer: reorganizes an already-executed query in place using its own execution plan, and escalates to DDL or decomposition only when a cheaper fix cannot work."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Louis N. Capece, Jr.", email = "lcapece@optonline.net" }]
+keywords = [
+  "amazon-redshift",
+  "redshift",
+  "sql",
+  "sqlglot",
+  "query-optimization",
+  "query-rewrite",
+  "query-fingerprint",
+  "distkey",
+  "sortkey",
+  "execution-plan",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+]
+
+# Hard dependency surface is deliberately ONE package.
+#
+# The destination machine is locked down and air-gapped from any external AI
+# service. Every extra hard dependency is another wheel that must be present
+# in the offline bundle and platform-matched at install time. redshift-connector
+# alone pulls boto3, botocore, requests, scramp, lxml, beautifulsoup4 and pytz —
+# so it lives in an optional extra and is imported lazily, never at module scope.
+# The destination already has redshift_connector installed independently.
+dependencies = [
+  "sqlglot>=26.0.0,<28",
+]
+
+[project.optional-dependencies]
+redshift = ["redshift-connector>=2.0.900"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/lcapece/redshift/tree/main/redshift_sqlopt#readme"
+Repository = "https://github.com/lcapece/redshift"
+Documentation = "https://github.com/lcapece/redshift/blob/main/redshift_sqlopt/README.md"
+Changelog = "https://github.com/lcapece/redshift/blob/main/redshift_sqlopt/CHANGELOG.md"
+Issues = "https://github.com/lcapece/redshift/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]

@@ -1,0 +1,13 @@
+database	schema	table_id	table	encoded	diststyle	sortkey1	max_varchar	sortkey1_enc	sortkey_num	size	pct_used	empty	unsorted	stats_off	tbl_rows	skew_sortkey1	skew_rows	estimated_visible_rows	risk_event	vacuum_sort_benefit	create_time
+tpcds	tpcds	100001	store_sales	Y	KEY(ss_item_sk)	ss_sold_date_sk	50	zstd	1	12400	68.2	0	42.5	18.0	2880404000	1.2	1.8	2880404000	none	14.2	2025-11-14 08:12:03
+tpcds	tpcds	100002	store_returns	Y	KEY(sr_item_sk)	sr_returned_date_sk	50	zstd	1	1280	54.1	0	11.4	6.0	287999764	1.1	1.4	287999764	none	2.8	2025-11-14 08:12:19
+tpcds	tpcds	100003	catalog_sales	Y	KEY(cs_item_sk)	cs_sold_date_sk	50	zstd	1	6840	71.3	0	28.6	12.0	1439980416	1.3	1.6	1439980416	none	7.1	2025-11-14 08:13:02
+tpcds	tpcds	100004	catalog_returns	Y	KEY(cr_item_sk)	cr_returned_date_sk	50	zstd	1	720	49.8	0	9.2	5.0	143996756	1.1	1.3	143996756	none	1.9	2025-11-14 08:13:44
+tpcds	tpcds	100005	web_sales	Y	KEY(ws_item_sk)	ws_sold_date_sk	50	zstd	1	3120	62.7	0	18.9	9.0	720000376	1.2	3.2	720000376	vacuum_sort	3.6	2025-11-14 08:14:17
+tpcds	tpcds	100006	web_returns	Y	KEY(wr_item_sk)	wr_returned_date_sk	50	zstd	1	360	46.4	0	7.3	4.0	71997522	1.1	1.3	71997522	none	1.1	2025-11-14 08:14:58
+tpcds	tpcds	100007	item	Y	ALL		200	zstd	0	48	82.1	0	0.0	32.0	402000	NULL	5.4	402000	stale_stats	0.0	2025-11-14 08:15:12
+tpcds	tpcds	100008	customer	Y	EVEN		120	NULL	0	840	72.1	0	5.0	8.0	12000000	NULL	1.1	12000000	none	0.4	2025-11-14 08:15:33
+tpcds	tpcds	100009	customer_address	Y	EVEN		80	NULL	0	312	68.9	0	3.1	6.0	6000000	NULL	1.0	6000000	none	0.2	2025-11-14 08:15:48
+tpcds	tpcds	100010	date_dim	Y	ALL		40	zstd	0	16	91.4	0	0.0	2.0	73049	NULL	1.0	73049	none	0.0	2025-11-14 08:16:01
+tpcds	tpcds	100011	store	Y	ALL		60	zstd	0	4	88.2	0	0.0	48.0	1002	NULL	1.0	1002	stale_stats	0.0	2025-11-14 08:16:09
+tpcds	tpcds	100012	warehouse	Y	ALL		90	zstd	0	1	42.0	0	0.0	0.0	15	NULL	1.0	15	none	0.0	2025-11-14 08:16:14

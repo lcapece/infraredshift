@@ -1,0 +1,16 @@
+# Pin lower bounds so fingerprinting / UI / warehouse behavior does not drift
+# silently across machines. sqlglot is pinned EXACTLY: its AST shape drives
+# SQL fingerprinting and repeat grouping, so a version drift silently changes
+# analysis results between machines.
+PySide6>=6.7.0,<7
+pandas>=2.2.0,<3
+numpy>=1.26.0,<3
+duckdb>=1.1.0,<2
+redshift-connector>=2.1.0,<3
+sqlglot==26.33.0
+rapidfuzz>=3.5.0,<4
+
+# Decomposition triage. Required. The bridge imports it lazily and degrades
+# gracefully if absent, but it ships as a required dependency so every install
+# has the feature.
+redshift-query-decomposer>=0.2.3

@@ -1,0 +1,6 @@
+Redshift Query Decomposer
+Copyright 2026 Louis N. Capece, Jr.
+
+This product includes software developed for the redshift-query-decomposer
+project. It depends on third-party libraries (including SQLGlot) that are
+distributed under their own licenses; see those packages for details.

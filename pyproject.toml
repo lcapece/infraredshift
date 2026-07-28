@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infraredshift"
+version = "0.1.0"
+description = "Amazon Redshift workload triage: captures SYS/SVV telemetry from producer and consumer clusters into local DuckDB, groups repeat query patterns, and ranks physical-design fixes by total time cost."
+readme = "README-PYPI.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Louis N. Capece, Jr.", email = "lcapece@optonline.net" }]
+keywords = [
+  "amazon-redshift",
+  "redshift",
+  "duckdb",
+  "query-analysis",
+  "workload-triage",
+  "distkey",
+  "sortkey",
+  "spectrum",
+  "query-optimization",
+  "database-tuning",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: System :: Monitoring",
+  "Environment :: X11 Applications :: Qt",
+  "Environment :: Win32 (MS Windows)",
+  "Operating System :: OS Independent",
+]
+
+# The desktop app is the product, so its runtime surface is a hard dependency
+# set rather than an extra. Upper bounds are pinned to the majors this has been
+# exercised against: a Qt or pandas major bump is exactly the kind of change
+# that breaks a GUI silently at import time.
+dependencies = [
+  "PySide6>=6.7.0,<7",
+  "pandas>=2.2.0,<3",
+  "numpy>=1.26.0,<3",
+  "duckdb>=1.1.0,<2",
+  # sqlglot is pinned EXACTLY, matching requirements.txt. Its AST shape drives
+  # SQL fingerprinting and repeat grouping, so a version drift silently changes
+  # which queries group together - i.e. it changes analysis results rather than
+  # breaking loudly. A range here would reintroduce exactly that drift.
+  "sqlglot==26.33.0",
+  "rapidfuzz>=3.5.0,<4",
+  # Decomposition triage. The bridge still imports it lazily and degrades
+  # gracefully if it is somehow absent, but it ships as a required dependency
+  # so every install has the feature.
+  "redshift-query-decomposer>=0.2.3",
+]
+
+[project.optional-dependencies]
+# Live capture from Redshift. Kept optional because redshift-connector pulls
+# boto3/botocore/requests/scramp/lxml/beautifulsoup4, and the app is fully
+# usable against an already-captured DuckDB warehouse without any of them.
+redshift = ["redshift-connector>=2.1.0,<3"]
+# JDBC capture path, used where the native connector is unavailable
+# (notably Windows on ARM, where JPype wheels are the practical route).
+jdbc = ["JayDeBeApi>=1.2.3", "JPype1>=1.5.0"]
+dev = ["pytest>=7.0"]
+# Everything optional in one go.
+all = [
+  "redshift-connector>=2.1.0,<3",
+  "JayDeBeApi>=1.2.3",
+  "JPype1>=1.5.0",
+]
+
+[project.scripts]
+infraredshift = "analyzer.app:run"
+infraredshift-loader = "analyzer.loader.cli:main"
+infraredshift-capture = "analyzer.ingest_redshift:main"
+
+[project.urls]
+Homepage = "https://github.com/lcapece/redshift#readme"
+Repository = "https://github.com/lcapece/redshift"
+Issues = "https://github.com/lcapece/redshift/issues"
+
+[tool.setuptools.packages.find]
+include = ["analyzer*"]
+exclude = ["tests*", "tools*", "kit*", "outputs*", "analyzer.samples*"]
+
+[tool.setuptools.package-data]
+"analyzer" = ["style.qss"]
+"analyzer.assets" = ["*.svg", "*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

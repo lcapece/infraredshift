@@ -1,0 +1,2591 @@
+
+
+# =============================================================================
+# SECTION 2 - table schemas and performance indexes, bundled from
+# analyzer/duckdb_store.py. Regenerate with tools/make_runner.py.
+# =============================================================================
+
+#<<STORE_LITERALS>>
+
+COMMON_COLUMNS = ("snapshot_id", "captured_at", "namespace_id")
+ROOT_ORDER = ("query_history", "query_text", "child_query_text", "query_history_all")
+QUERY_EVIDENCE_TABLES = frozenset(EXTRACTIONS)
+NO_QUALIFYING_QUERY_STATUS = "Complete — no qualifying queries"
+CONSUMER_CATALOG_DATABASE_NOT_PRESENT_STATUS = (
+    "Complete — enterprise_datawarehouse not present on this consumer"
+)
+# Emergency operating policy. All catalog datasets that normally cycle across
+# Redshift databases use these explicit role-specific lists until the operator
+# asks to restore database discovery.
+PRODUCER_CATALOG_DATABASE_SCOPE = (
+    "datalake_cl",
+    "enterprise_datawarehouse",
+    "businesslayer",
+    "datalake_wealth",
+    "datalake_cl1",
+    "datalake_cl2",
+    "datalake",
+    "byod",
+    "investors_bank",
+    "smart_leads",
+)
+CONSUMER_CATALOG_DATABASE_SCOPE = ("enterprise_datawarehouse",)
+# Backward-compatible public name: standalone producer loaders historically
+# imported CATALOG_DATABASE_SCOPE.
+CATALOG_DATABASE_SCOPE = PRODUCER_CATALOG_DATABASE_SCOPE
+CATALOG_DATABASE_SCOPE_KEY = (
+    f"producer={','.join(PRODUCER_CATALOG_DATABASE_SCOPE)}|"
+    f"consumer={','.join(CONSUMER_CATALOG_DATABASE_SCOPE)}"
+)
+DATABASE_CYCLED_TABLES = frozenset((
+    "svv_table_info_all",
+    "view_definitions",
+    "procedure_definitions",
+    "external_table_metadata",
+    "external_table_info_all",
+))
+LIVE_REFRESH_TABLES = tuple(EXTRACTIONS) + (
+    "svv_table_info_all", "view_definitions", "procedure_definitions",
+    "external_table_metadata", "external_table_info_all"
+)
+SCRIPT_NAME = Path(__file__).name
+SCRIPT_PATH = Path(__file__).resolve()
+
+
+def runner_command(*arguments: object) -> str:
+    """Copy/paste-safe command that works even when the current folder differs."""
+    values = [sys.executable, str(SCRIPT_PATH), *(str(value) for value in arguments)]
+    return " ".join('"' + value.replace('"', '\\"') + '"' for value in values)
+
+
+def tmp_name(table_name: str) -> str:
+    return f"{table_name}_tmp"
+
+
+# External-table capture is EXCLUDED in this version. The SVV_EXTERNAL_*
+# stage is disabled everywhere until it can be revalidated against the
+# guarded corporate cluster; flip to True to restore the optional final
+# stage (the UI and plan validation all key off this one switch).
+EXTERNAL_CAPTURE_ENABLED = False
+
+def selected_refresh_tables(args) -> tuple[str, ...]:
+    """Return a validated, ordered refresh plan.
+
+    ``None`` means the complete plan.  An explicit selection is kept in the
+    canonical dependency order, and external metadata remains an optional
+    last step. Evidence tables can run without root tables by using their
+    existing live-threshold SQL fallback; parent IDs are derived only when
+    both query_history and query_text are in this load.
+    """
+    requested = getattr(args, "include_tables", None)
+    if requested is None:
+        selected = set(LIVE_REFRESH_TABLES)
+    else:
+        selected = {
+            str(value).strip()
+            for value in requested
+            if str(value).strip()
+        }
+        unknown = sorted(selected - set(LIVE_REFRESH_TABLES))
+        if unknown:
+            raise ValueError(f"Unknown loader table(s): {', '.join(unknown)}")
+    if not EXTERNAL_CAPTURE_ENABLED:
+        selected.discard("external_table_info_all")
+    if not bool(getattr(args, "include_external", True)):
+        selected.discard("external_table_info_all")
+    plan = tuple(table for table in LIVE_REFRESH_TABLES if table in selected)
+    if not plan:
+        raise ValueError("Select at least one DuckDB table to refresh.")
+    return plan
+
+
+def quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _index_name(table_name: str, columns: tuple[str, ...]) -> str:
+    return "idx_" + re.sub(r"[^a-z0-9_]+", "_", f"{table_name}_{'_'.join(columns)}".lower())
+
+
+def sql_hash(sql: str) -> str:
+    normalized = "\n".join(line.rstrip() for line in str(sql or "").strip().splitlines()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _raw_store_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+# ------------------------------------------------------------- duckdb access
+
+
+def _is_lock_conflict(exc: Exception) -> bool:
+    """Only a DuckDB IO error whose text names the file lock is retryable.
+
+    The type gate keeps unrelated errors that merely mention "lock" from
+    spinning the retry loop; the wording gate keeps other IO errors (disk
+    full, corrupt file) failing fast.
+    """
+    io_exception = getattr(duckdb, "IOException", None)
+    if io_exception is not None and not isinstance(exc, io_exception):
+        return False
+    message = str(exc).lower()
+    return "lock" in message or "being used" in message
+
+
+def open_duck(path: Path, wait_seconds: float):
+    """Open the analyzer DuckDB file, retrying while the app holds the lock."""
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    announced = False
+    while True:
+        try:
+            return duckdb.connect(str(path))
+        except Exception as exc:
+            if not _is_lock_conflict(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"Gave up after {wait_seconds:.0f}s: the DuckDB file is still locked by "
+                    "another process (probably the analyzer app mid-query). Re-run when it is idle, "
+                    "or raise --lock-wait-seconds."
+                )
+            if not announced:
+                print("  DuckDB file busy (analyzer app is reading); waiting for a free moment ...")
+                announced = True
+            time.sleep(3)
+
+
+def ensure_table(con, table_name: str, columns) -> None:
+    con.execute(
+        f"CREATE TABLE IF NOT EXISTS {quote_ident(table_name)} (snapshot_id VARCHAR, captured_at TIMESTAMP)"
+    )
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [table_name],
+        ).fetchall()
+    }
+    for col in tuple(COMMON_COLUMNS) + tuple(columns):
+        if col in existing:
+            continue
+        dtype = "TIMESTAMP" if col == "captured_at" else "VARCHAR"
+        con.execute(f"ALTER TABLE {quote_ident(table_name)} ADD COLUMN {quote_ident(col)} {dtype}")
+        existing.add(col)
+
+
+def ensure_indexes(con) -> None:
+    """The analyzer's canonical performance indexes, applied to the live tables."""
+    for table_name, columns in PERFORMANCE_INDEXES:
+        existing_columns = {
+            row[0]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                [table_name],
+            ).fetchall()
+        }
+        index_columns = tuple(col for col in columns if col in existing_columns)
+        if not index_columns:
+            continue
+        con.execute(
+            f"CREATE INDEX IF NOT EXISTS {quote_ident(_index_name(table_name, index_columns))} "
+            f"ON {quote_ident(table_name)} ({', '.join(quote_ident(c) for c in index_columns)})"
+        )
+
+
+def _ensure_stash_tables(con) -> None:
+    con.execute(f"CREATE TABLE IF NOT EXISTS {STATE_TABLE} (state_key VARCHAR, state_value VARCHAR)")
+    con.execute(f"CREATE TABLE IF NOT EXISTS {SQL_STASH_TABLE} (table_name VARCHAR, sql_text VARCHAR)")
+
+
+def save_state(duckdb_path: Path, lock_wait: float, values: dict) -> None:
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        _ensure_stash_tables(con)
+        for key, value in values.items():
+            con.execute(f"DELETE FROM {STATE_TABLE} WHERE state_key = ?", [key])
+            con.execute(f"INSERT INTO {STATE_TABLE} VALUES (?, ?)", [key, str(value)])
+    finally:
+        con.close()
+
+
+def read_state(con) -> dict:
+    try:
+        rows = con.execute(f"SELECT state_key, state_value FROM {STATE_TABLE}").fetchall()
+    except Exception:
+        return {}
+    return {str(k): str(v) for k, v in rows}
+
+
+def write_tmp_table(
+    duckdb_path: Path, base_table: str, frame, snapshot_id: str, sql_text: str,
+    lock_wait: float, *, append: bool = False,
+) -> None:
+    """One short lock window: rebuild <base_table>_tmp from the fetched frame."""
+    target = tmp_name(base_table)
+    df = frame.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    for col in df.columns:
+        df[col] = df[col].map(_raw_store_value)
+    df.insert(0, "captured_at", datetime.now())
+    df.insert(0, "snapshot_id", snapshot_id)
+    columns = list(dict.fromkeys(df.columns))
+
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        if not append:
+            con.execute(f"DROP TABLE IF EXISTS {quote_ident(target)}")
+        expected = tuple(EXPECTED_COLUMNS.get(base_table, ())) + tuple(c for c in columns if c not in COMMON_COLUMNS)
+        ensure_table(con, target, expected)
+        registered = f"incoming_{uuid.uuid4().hex}"
+        con.register(registered, df)
+        try:
+            select_list = [
+                f"CAST({quote_ident(col)} AS TIMESTAMP) AS {quote_ident(col)}"
+                if col == "captured_at"
+                else f"CAST({quote_ident(col)} AS VARCHAR) AS {quote_ident(col)}"
+                for col in columns
+            ]
+            con.execute(
+                f"INSERT INTO {quote_ident(target)} ({', '.join(quote_ident(c) for c in columns)}) "
+                f"SELECT {', '.join(select_list)} FROM {quote_ident(registered)}"
+            )
+        finally:
+            con.unregister(registered)
+        _ensure_stash_tables(con)
+        if not append:
+            con.execute(f"DELETE FROM {SQL_STASH_TABLE} WHERE table_name = ?", [base_table])
+            con.execute(f"INSERT INTO {SQL_STASH_TABLE} VALUES (?, ?)", [base_table, sql_text])
+        rows = con.execute(f"SELECT COUNT(*) FROM {quote_ident(target)}").fetchone()[0]
+    finally:
+        con.close()
+    print(f"  {target}: {int(rows or 0):,} row(s) written")
+
+
+def stamp_cluster_namespace(frame, cfg):
+    """Attach the supplied namespace to every Redshift-sourced row."""
+    df = frame.copy() if frame is not None else pd.DataFrame()
+    namespace = str(getattr(cfg, "namespace_id", "") or "producer").strip() or "producer"
+    if "namespace_id" in df.columns:
+        df["namespace_id"] = namespace
+    else:
+        df.insert(0, "namespace_id", namespace)
+    return df
+
+
+# ------------------------------------------------------------ redshift access
+
+
+def connect_redshift(cfg, database: str):
+    import redshift_connector
+
+    conn = redshift_connector.connect(
+        host=cfg.host,
+        port=cfg.port,
+        database=database,
+        user=cfg.user,
+        password=cfg.password,
+    )
+    conn.autocommit = True
+    return conn
+
+
+def fetch_frame(cfg, database: str, sql: str, stage: str = ""):
+    conn = connect_redshift(cfg, database)
+    try:
+        cur = conn.cursor()
+        try:
+            timeout_ms = int(getattr(cfg, "statement_timeout_ms", 0) or 0)
+            if timeout_ms > 0:
+                cur.execute(f"SET statement_timeout TO {timeout_ms}")
+            cur.execute(sql)
+            columns = [str(d[0]) for d in cur.description]
+            rows: list = []
+            last_report = 0
+            while True:
+                batch = cur.fetchmany(FETCH_BATCH_ROWS)
+                if not batch:
+                    break
+                rows.extend(batch)
+                if len(rows) - last_report >= 100_000:
+                    last_report = len(rows)
+                    print(f"    {stage}: {len(rows):,} rows fetched ...")
+            return pd.DataFrame.from_records(rows, columns=columns)
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+
+def fetch_columns(cfg, database: str, view_name: str) -> list:
+    conn = connect_redshift(cfg, database)
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT * FROM {view_name} WHERE 1 = 0")
+            return [str(d[0]) for d in cur.description]
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+
+def validate_source_columns(cfg, database: str, view_name: str) -> None:
+    actual = fetch_columns(cfg, database, view_name)
+    normalized = {c.lower() for c in actual}
+    required = {c.lower() for c in SOURCE_REQUIREMENTS[view_name]}
+    missing = sorted(required - normalized)
+    if missing:
+        raise SystemExit(
+            f"{database}.{view_name} is missing required column(s): {missing}. "
+            "The cluster's system views do not match what this capture expects."
+        )
+    print(f"  {database}.{view_name}: {len(actual)} columns ok")
+
+
+def _external_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "statement timeout", "canceling statement", "cancelled on user's request",
+        "system requested abort", "abort query", "query timeout", "timed out",
+    ))
+
+
+def _external_timeout_decision(cfg, stage: str, exc: Exception) -> str:
+    callback = getattr(cfg, "timeout_decision_callback", None)
+    if callable(callback):
+        return str(callback(stage, str(exc)) or "next").strip().lower()
+    if sys.stdin.isatty():
+        print(f"\nExternal stage reached its 10-minute timeout: {stage}\n{exc}")
+        answer = input("Retry for another 10 minutes [R], or move to the next step [N]? ").strip().lower()
+        return "continue" if answer in {"r", "retry", "c", "continue"} else "next"
+    return "next"
+
+
+def fetch_external_stage(cfg, database: str, sql: str, stage: str, *, optional: bool = True):
+    """Fetch one Redshift view with a retry/skip decision at the timeout."""
+    while True:
+        try:
+            return fetch_frame(cfg, database, sql, stage=stage)
+        except Exception as exc:
+            if _external_timeout_error(exc):
+                if _external_timeout_decision(cfg, stage, exc) == "continue":
+                    print(f"  Retrying {stage} with a fresh 10-minute window ...")
+                    continue
+                print(f"  {stage}: skipped after timeout; continuing to the next stage")
+                return pd.DataFrame()
+            if optional:
+                print(f"  OPTIONAL STAGE SKIPPED: {stage}: {exc}")
+                return pd.DataFrame()
+            raise
+
+
+def validate_primary_sources(cfg) -> None:
+    for view_name in (
+        "sys_query_detail",
+        "sys_query_history",
+        "sys_query_explain",
+        "sys_query_text",
+        "sys_child_query_text",
+        "pg_user",
+    ):
+        validate_source_columns(cfg, cfg.primary_database, view_name)
+
+
+def resolve_table_databases(cfg) -> tuple:
+    namespace = str(getattr(cfg, "namespace_id", "") or "unknown")
+    role = str(getattr(cfg, "cluster_role", "") or "").strip().lower()
+    scope = (
+        CONSUMER_CATALOG_DATABASE_SCOPE
+        if role == "consumer"
+        else PRODUCER_CATALOG_DATABASE_SCOPE
+    )
+    print(
+        f"Using fixed {role or 'producer'} catalog database scope for "
+        f"namespace {namespace}: {', '.join(scope)} "
+        "(automatic database discovery disabled by emergency policy)"
+    )
+    return scope
+
+
+# --------------------------------------------------- normalizers (from ingest)
+
+
+def _view_definition_part(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value)
+    return "" if text in {"None", "NULL", "nan"} else text
+
+
+def _procedure_body_begin_to_end(value) -> str:
+    text = _view_definition_part(value)
+    if not text:
+        return ""
+    begin = re.search(r"\bbegin\b", text, flags=re.IGNORECASE)
+    if not begin:
+        return text.strip()
+    end_matches = list(re.finditer(r"\bend\b\s*;?", text, flags=re.IGNORECASE))
+    end_after_begin = [match for match in end_matches if match.start() >= begin.start()]
+    if not end_after_begin:
+        return text[begin.start():].strip()
+    end = end_after_begin[-1]
+    return text[begin.start():end.end()].strip()
+
+
+def normalize_view_definitions(frame, database: str):
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["database", "schema", "view_name", "source_definition"])
+    df = frame.copy()
+    rename = {}
+    for col in df.columns:
+        normalized = str(col).strip().lower()
+        if normalized == "schemaname":
+            rename[col] = "schema"
+        elif normalized == "viewname":
+            rename[col] = "view_name"
+    if rename:
+        df = df.rename(columns=rename)
+    if "database" not in df.columns:
+        df["database"] = database
+    part_cols = sorted(
+        [col for col in df.columns if re.match(r"definition_part_\d+$", str(col).strip().lower())],
+        key=lambda col: int(re.search(r"(\d+)$", str(col)).group(1)),
+    )
+    if part_cols:
+        df["source_definition"] = df[part_cols].apply(
+            lambda row: "".join(_view_definition_part(value) for value in row), axis=1
+        )
+    elif "source_definition" not in df.columns:
+        df["source_definition"] = ""
+    for col in ("schema", "view_name"):
+        if col not in df.columns:
+            df[col] = ""
+    return df[["database", "schema", "view_name", "source_definition"]]
+
+
+def normalize_procedure_definitions(frame, database: str):
+    out_cols = [
+        "database", "schema", "procedure_name", "procedure_oid", "procedure_key",
+        "owner_id", "owner_name", "argument_names", "argument_modes",
+        "argument_type_oids", "all_argument_type_oids", "source_length", "source_definition",
+    ]
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=out_cols)
+    df = frame.copy()
+    rename = {}
+    for col in df.columns:
+        normalized = str(col).strip().lower()
+        if normalized in {"nspname", "schemaname", "schema_name"}:
+            rename[col] = "schema"
+        elif normalized in {"proname", "procname", "stored_procedure_name"}:
+            rename[col] = "procedure_name"
+        elif normalized in {"prooid", "oid"}:
+            rename[col] = "procedure_oid"
+        elif normalized in {"prosrc", "procedure_source", "definition", "procedure_definition"}:
+            rename[col] = "source_definition"
+    if rename:
+        df = df.rename(columns=rename)
+    if "database" not in df.columns:
+        df["database"] = database
+    part_cols = sorted(
+        [col for col in df.columns if re.match(r"definition_part_\d+$", str(col).strip().lower())],
+        key=lambda col: int(re.search(r"(\d+)$", str(col)).group(1)),
+    )
+    if part_cols:
+        df["source_definition"] = df[part_cols].apply(
+            lambda row: "".join(_view_definition_part(value) for value in row), axis=1
+        )
+    elif "source_definition" not in df.columns:
+        df["source_definition"] = ""
+    df["source_definition"] = df["source_definition"].map(_procedure_body_begin_to_end)
+    df["source_length"] = df["source_definition"].map(lambda value: len(str(value or "")))
+    for col in (
+        "schema", "procedure_name", "procedure_oid", "owner_id", "owner_name",
+        "argument_names", "argument_modes", "argument_type_oids",
+        "all_argument_type_oids", "source_length",
+    ):
+        if col not in df.columns:
+            df[col] = ""
+    if "procedure_key" not in df.columns:
+        df["procedure_key"] = df.apply(
+            lambda row: ".".join(
+                str(row.get(key) or "").strip().lower()
+                for key in ("database", "schema", "procedure_name")
+            ),
+            axis=1,
+        )
+    return df[out_cols]
+
+
+# --------------------------------------------- phase-2 parent representatives
+
+
+_FP_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_FP_STRING_RE = re.compile(r"'(?:[^']|'')*'")
+_FP_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+_FP_WS_RE = re.compile(r"\s+")
+
+
+def simple_fingerprint(sql) -> str:
+    """Literal-insensitive grouping key (standalone stand-in for the app's
+    sqlglot canonical fingerprint)."""
+    text = _FP_COMMENT_RE.sub(" ", str(sql or "").lower())
+    text = _FP_STRING_RE.sub("?", text)
+    text = _FP_NUMBER_RE.sub("?", text)
+    return _FP_WS_RE.sub(" ", text).strip()
+
+
+def compute_parent_target_ids(con, snapshot_id: str, limit: int, floor_basis: str,
+                              history_table: str, text_table: str,
+                              namespace_id: str | None = None) -> list:
+    """Group the captured _tmp roots into parents by literal-agnostic SQL text
+    and return one representative query_id (the heaviest execution) per parent,
+    ranked by the parent's TOTAL time on the chosen basis."""
+    basis = str(floor_basis or "execution_time").strip().lower()
+    if basis not in {"execution_time", "elapsed_time"}:
+        basis = "execution_time"
+    try:
+        history_cols = {
+            str(row[0]).lower()
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                [history_table],
+            ).fetchall()
+        }
+        history_text = "NULLIF(h.query_text, '')" if "query_text" in history_cols else "NULL"
+        namespace_filter = " AND namespace_id = ?" if namespace_id else ""
+        query_params = [snapshot_id]
+        if namespace_id:
+            query_params.append(namespace_id)
+        query_params.append(snapshot_id)
+        if namespace_id:
+            query_params.append(namespace_id)
+        frame = con.execute(
+            f"""
+SELECT
+  h.query_id,
+  COALESCE(TRY_CAST(h.{basis} AS BIGINT), 0) AS execution_time,
+  COALESCE(NULLIF(t.sql_text, ''), {history_text}, '') AS sql_text
+FROM {quote_ident(history_table)} h
+LEFT JOIN (
+  SELECT
+    query_id,
+    STRING_AGG(
+      COALESCE(NULLIF(text, ''), NULLIF(sql_text, ''), NULLIF(query_text, ''), ''),
+      ''
+      ORDER BY COALESCE(TRY_CAST(sequence AS BIGINT), TRY_CAST(sequence_num AS BIGINT), 0)
+    ) AS sql_text
+  FROM {quote_ident(text_table)}
+  WHERE snapshot_id = ?{namespace_filter}
+  GROUP BY query_id
+) t ON t.query_id = h.query_id
+WHERE h.snapshot_id = ?{namespace_filter.replace('namespace_id', 'h.namespace_id')}
+""",
+            query_params,
+        ).fetchdf()
+    except Exception:
+        return []
+    if frame is None or frame.empty:
+        return []
+    groups: dict = {}
+    for row in frame.itertuples(index=False):
+        text = str(row.sql_text or "").strip()
+        if not text:
+            continue
+        fingerprint = simple_fingerprint(text) or text
+        execution = int(row.execution_time or 0)
+        group = groups.setdefault(fingerprint, {"total": 0, "best_execution": -1, "best_id": None})
+        group["total"] += execution
+        if execution > group["best_execution"]:
+            group["best_execution"] = execution
+            group["best_id"] = row.query_id
+    ranked = sorted(groups.values(), key=lambda group: -group["total"])
+    cap = max(0, int(limit or 0))
+    selected = ranked if cap <= 0 else ranked[:cap]
+    target_ids = []
+    for group in selected:
+        try:
+            target_ids.append(int(str(group["best_id"])))
+        except (TypeError, ValueError):
+            continue
+    return target_ids
+
+
+# --------------------------------------------------------------- SQL dispatch
+
+
+ROOT_TABLE_SET = frozenset(ROOT_ORDER)
+
+
+def table_sql(cfg, table_name: str, target_ids=None) -> str:
+    if table_name in ROOT_TABLE_SET:
+        return EXTRACTIONS[table_name](
+            cfg.minutes,
+            cfg.evidence_parent_limit,
+            cfg.rank_by,
+            min_execution_seconds=cfg.floor_seconds,
+            floor_basis=cfg.floor_basis,
+            window_days=cfg.days,
+        )
+    if table_name == "query_detail_flow":
+        return EXTRACTIONS[table_name](
+            cfg.minutes, cfg.evidence_parent_limit, cfg.detail_flow_rows, cfg.rank_by, target_ids=target_ids
+        )
+    if table_name == "user_info":
+        return EXTRACTIONS[table_name](cfg.minutes, cfg.evidence_parent_limit, cfg.rank_by)
+    if table_name in EXTRACTIONS:
+        return EXTRACTIONS[table_name](cfg.minutes, cfg.evidence_parent_limit, cfg.rank_by, target_ids=target_ids)
+    if table_name == "svv_table_info_all":
+        return TABLE_INFO_SQL
+    if table_name == "external_table_info_all":
+        return EXTERNAL_TABLE_INFO_SQL
+    if table_name == "view_definitions":
+        return VIEW_DEFINITIONS_SQL
+    if table_name == "procedure_definitions":
+        return PROCEDURE_DEFINITIONS_SQL
+    raise ValueError(f"Unknown table: {table_name}")
+
+
+# ---------------------------------------------------------------- environment
+
+
+def sense_environment(args) -> list:
+    problems = []
+    if sys.version_info < MIN_PYTHON:
+        problems.append(
+            f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required (you have "
+            f"{sys.version_info.major}.{sys.version_info.minor})."
+        )
+    if _IMPORT_ERROR is not None:
+        problems.append(f"Missing package ({_IMPORT_ERROR}). Fix:  pip install duckdb pandas")
+    if not (args.swap or args.status or args.backup_only):
+        try:
+            __import__("redshift_connector")
+        except ImportError:
+            problems.append("Missing package 'redshift_connector'. Fix:  pip install redshift-connector")
+        configured = bool(
+            _credential_value("REDSHIFT_PRODUCER_HOST")
+            or _credential_value("REDSHIFT_HOST")
+        )
+        producer_enabled_name = (
+            "REDSHIFT_ENABLED"
+            if os.environ.get("REDSHIFT_ENABLED") is not None
+            else "REDSHIFT_PRODUCER_ENABLED"
+        )
+        selected = _env_enabled(producer_enabled_name, default=configured)
+        selected = selected or any(
+            _env_enabled(f"REDSHIFT_CONSUMER_{ordinal}_ENABLED", default=False)
+            or (
+                os.environ.get(f"REDSHIFT_CONSUMER_{ordinal}_ENABLED") is None
+                and bool(_credential_value(f"REDSHIFT_CONSUMER_{ordinal}_HOST"))
+            )
+            for ordinal in _configured_consumer_ordinals()
+        )
+        if not selected:
+            problems.append("No Redshift cluster is checked for loading. Set at least one profile's ENABLED value to true.")
+    duckdb_path = Path(args.duckdb_path)
+    if not duckdb_path.is_file():
+        if args.swap or args.status or args.backup_only:
+            problems.append(
+                f"DuckDB file not found at {duckdb_path}. Run the normal load first, or pass --duckdb-path "
+                "to an existing analyzer database."
+            )
+        else:
+            try:
+                duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                problems.append(f"DuckDB folder cannot be created at {duckdb_path.parent}: {exc}")
+    return problems
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return bool(default)
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "y", "on", "checked"}:
+        return True
+    if value in {"0", "false", "no", "n", "off", "unchecked"}:
+        return False
+    raise SystemExit(f"{name} must be true or false, got {raw!r}.")
+
+
+def _configured_consumer_ordinals() -> tuple[int, ...]:
+    active = _active_profile_prefixes()
+    if active is not None:
+        return tuple(sorted(
+            int(match.group(1))
+            for prefix in active
+            if (match := re.fullmatch(r"REDSHIFT_CONSUMER_(\d+)", prefix))
+        ))
+    keys = set(os.environ)
+    try:
+        from analyzer.secrets_store import session_secrets
+
+        keys.update(session_secrets())
+    except ImportError:
+        pass
+    return tuple(sorted({
+        int(match.group(1))
+        for key in keys
+        if (match := re.match(r"^REDSHIFT_CONSUMER_(\d+)_", str(key).upper()))
+    }))
+
+
+def _active_profile_prefixes() -> tuple[str, ...] | None:
+    """Exact portable-manifest membership, or None for legacy discovery."""
+    if ACTIVE_PROFILE_PREFIXES_ENV not in os.environ:
+        return None
+    result: list[str] = []
+    for value in str(os.environ.get(ACTIVE_PROFILE_PREFIXES_ENV) or "").split(","):
+        prefix = value.strip().upper()
+        if (
+            prefix == "REDSHIFT_PRODUCER"
+            or re.fullmatch(r"REDSHIFT_CONSUMER_\d+", prefix)
+        ) and prefix not in result:
+            result.append(prefix)
+    return tuple(result)
+
+
+def _credential_value(name: str) -> str:
+    """Resolve a profile value without exporting protected data to the environment."""
+    try:
+        from analyzer.secrets_store import session_secret
+
+        protected = str(session_secret(name) or "").strip()
+        if protected:
+            return protected
+    except ImportError:
+        pass
+    # Standalone legacy runner copies may still be supplied with process-only
+    # values. The Databa6ix loader resolves its encrypted session first.
+    return str(os.environ.get(name) or "").strip()
+
+
+# Administrator-adjustable per cluster via FLOOR_SECONDS in the portable
+# cluster-profiles JSON; these are only the fallbacks when it is not set.
+DEFAULT_PRODUCER_FLOOR_SECONDS = 300.0
+DEFAULT_CONSUMER_FLOOR_SECONDS = 30.0
+
+
+def _cluster_floor_seconds(value_fn, default: float) -> float:
+    """Per-cluster sys_query_history runtime floor, else the load default."""
+    raw = str(value_fn("FLOOR_SECONDS", "REDSHIFT_FLOOR_SECONDS") or "").strip()
+    if not raw:
+        return default
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return default
+    return seconds if 0 <= seconds <= 86400 else default
+
+
+def _floor_fallback(args, role: str) -> float:
+    """Explicit --floor-seconds if given, else the role default."""
+    explicit = getattr(args, "floor_seconds", None)
+    if explicit is not None:
+        return float(explicit)
+    return DEFAULT_PRODUCER_FLOOR_SECONDS if role == "producer" else DEFAULT_CONSUMER_FLOOR_SECONDS
+
+
+def _profile_config(args, prefix: str, role: str, ordinal: int = 0) -> argparse.Namespace | None:
+    legacy = role == "producer"
+    def value(name: str, legacy_name: str | tuple[str, ...] | None = None, default: str = "") -> str:
+        found = _credential_value(f"{prefix}_{name}") or None
+        if found is None and legacy and legacy_name:
+            names = (legacy_name,) if isinstance(legacy_name, str) else legacy_name
+            found = next((_credential_value(candidate) for candidate in names if _credential_value(candidate)), None)
+        return str(found if found is not None else default).strip()
+
+    host = value("HOST", "REDSHIFT_HOST")
+    enabled_name = (
+        "REDSHIFT_ENABLED"
+        if legacy and os.environ.get("REDSHIFT_ENABLED") is not None
+        else f"{prefix}_ENABLED"
+    )
+    enabled = _env_enabled(enabled_name, default=bool(host))
+    if not enabled:
+        return None
+    if not host:
+        raise SystemExit(f"{prefix}_HOST is required when {prefix}_ENABLED=true.")
+    namespace_id = (
+        str(os.environ.get("REDSHIFT_NAMESPACE") or "").strip()
+        if legacy
+        else ""
+    ) or value("NAMESPACE_ID", "REDSHIFT_NAMESPACE_ID")
+    if not namespace_id:
+        raise SystemExit(f"{prefix}_NAMESPACE_ID is required when {prefix}_HOST is configured.")
+    user = value("USER", "REDSHIFT_USER")
+    if not user:
+        raise SystemExit(f"{prefix}_USER is required.")
+    password = value("PASSWORD", "REDSHIFT_PASSWORD")
+    if not password:
+        if sys.stdin.isatty():
+            password = getpass.getpass(f"Redshift password for {role} {ordinal or ''}: ")
+        if not password:
+            raise SystemExit(f"{prefix}_PASSWORD is not set and no password was entered.")
+    return argparse.Namespace(
+        namespace_id=namespace_id,
+        cluster_role=role,
+        cluster_ordinal=ordinal,
+        enabled=True,
+        cluster_name=(
+            value("DISPLAY_NAME")
+            or value("FRIENDLY", "REDSHIFT_FRIENDLY")
+            or (str(os.environ.get("REDSHIFT_ENV") or "").strip() if legacy else "")
+            or ("Producer" if legacy else f"Consumer {ordinal}")
+        ),
+        host=host,
+        port=int(value("PORT", "REDSHIFT_PORT", str(DEFAULT_REDSHIFT_PORT))),
+        user=user,
+        password=password,
+        primary_database=(
+            value("PRIMARY_DATABASE", "REDSHIFT_PRIMARY_DATABASE")
+            or value("DATABASE", "REDSHIFT_DATABASE")
+            or "dev"
+        ),
+        table_databases="",
+        db_min_query_count=int(value("DATABASE_MIN_QUERY_COUNT", "REDSHIFT_DATABASE_MIN_QUERY_COUNT", "250")),
+        days=float(args.days),
+        # Floor precedence: FLOOR_SECONDS in the cluster profiles JSON, then an
+        # explicit --floor-seconds, then the role default (producer 300s,
+        # consumers 30s).
+        floor_seconds=_cluster_floor_seconds(value, _floor_fallback(args, role)),
+        floor_basis=args.floor_basis,
+        # `minutes` is the slow-query threshold used by the evidence fallback
+        # CTE when no parent ids resolve - keep it aligned with the floor.
+        minutes=max(1, int(round(_cluster_floor_seconds(value, _floor_fallback(args, role)) / 60.0))),
+        rank_by=os.environ.get("REDSHIFT_TOP_QUERY_RANK_BY", "elapsed_time").strip().lower() or "elapsed_time",
+        evidence_parent_limit=max(0, int(os.environ.get("REDSHIFT_EVIDENCE_PARENT_LIMIT", "0") or 0)),
+        detail_flow_rows=int(os.environ.get("REDSHIFT_DETAIL_FLOW_ROWS_PER_QUERY", str(DEFAULT_DETAIL_FLOW_ROWS_PER_QUERY))),
+    )
+
+
+def build_configs(args) -> tuple[argparse.Namespace, ...]:
+    active = _active_profile_prefixes()
+    profiles = []
+    if active is None or "REDSHIFT_PRODUCER" in active:
+        profiles.append(
+            _profile_config(args, "REDSHIFT_PRODUCER", "producer")
+        )
+    for ordinal in _configured_consumer_ordinals():
+        profile = _profile_config(args, f"REDSHIFT_CONSUMER_{ordinal}", "consumer", ordinal)
+        if profile is not None:
+            profiles.append(profile)
+    configs = tuple(profile for profile in profiles if profile is not None)
+    if not configs:
+        raise SystemExit("No Redshift cluster is checked for loading. Enable at least one cluster profile.")
+    namespaces = [cfg.namespace_id.lower() for cfg in configs]
+    if len(namespaces) != len(set(namespaces)):
+        raise SystemExit("Every configured cluster must have a unique NAMESPACE_ID.")
+    return configs
+
+
+def build_config(args) -> argparse.Namespace:
+    """Backward-compatible first-selected config used by focused tools."""
+    return build_configs(args)[0]
+
+
+# ------------------------------------------------------------------ load mode
+
+
+def _resolve_run(args, duckdb_path: Path):
+    """Fresh run by default. With --resume, continue an interrupted load under
+    its original snapshot id, skipping tables whose SQL stash row landed."""
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        state = read_state(con)
+        resumable = (
+            args.resume
+            and state.get("status") == "loading"
+            and bool(state.get("snapshot_id"))
+            and state.get("days") == str(args.days)
+            and state.get("floor_seconds") == str(args.floor_seconds)
+            and state.get("floor_basis") == args.floor_basis
+        )
+        if args.resume and not resumable:
+            print("Nothing resumable (no interrupted load, or its window/floor settings differ); starting fresh.")
+        if resumable:
+            try:
+                stash = {str(row[0]) for row in con.execute(f"SELECT table_name FROM {SQL_STASH_TABLE}").fetchall()}
+            except Exception:
+                stash = set()
+            return state["snapshot_id"], stash
+        _ensure_stash_tables(con)
+        con.execute(f"DELETE FROM {SQL_STASH_TABLE}")
+        con.execute(f"DELETE FROM {STATE_TABLE}")
+    finally:
+        con.close()
+    return str(uuid.uuid4()), set()
+
+
+def run_load(args) -> int:
+    """Use one checkpoint format and one integrity path for every load.
+
+    The former single-cluster implementation did not create namespace
+    checkpoints and therefore could not prove that interrupted staging was
+    complete.  The namespaced loader works for one cluster as well as many.
+    """
+    return run_multi_load(args, build_configs(args))
+
+
+def _legacy_single_cluster_load(args) -> int:
+    """Retained only as readable migration history; no entry point calls it."""
+    configs = build_configs(args)
+    if len(configs) > 1:
+        return run_multi_load(args, configs)
+    cfg = configs[0]
+    duckdb_path = Path(args.duckdb_path)
+    snapshot_id, completed_tables = _resolve_run(args, duckdb_path)
+    if completed_tables:
+        print(f"Resuming interrupted load: {len(completed_tables)} table(s) already finished will be skipped.")
+
+    print(f"== Refresh window: {cfg.days:g} day(s), {cfg.floor_seconds:.0f}s+ on {cfg.floor_basis} ==")
+    print(f"== Target file: {duckdb_path} (writes go to *_tmp tables only) ==\n")
+
+    print("Validating Redshift source views")
+    validate_primary_sources(cfg)
+
+    save_state(
+        duckdb_path,
+        args.lock_wait_seconds,
+        {
+            "snapshot_id": snapshot_id,
+            "label": "tmp refresh",
+            "days": str(args.days),
+            "floor_seconds": str(args.floor_seconds),
+            "floor_basis": cfg.floor_basis,
+            "catalog_database_scope": CATALOG_DATABASE_SCOPE_KEY,
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "loading",
+            "selected_tables": ",".join(selected_refresh_tables(args)),
+        },
+    )
+    # Single-cluster loads must publish the cluster registry too: the per-role
+    # files feed the merge, and the merge resolves roles/friendly names from
+    # snapshot_cluster_runs promoted out of this staging table.
+    _record_tmp_cluster_registry(duckdb_path, args.lock_wait_seconds, snapshot_id, [cfg])
+
+    target_ids: list | None = None
+
+    def capture(table_name: str) -> None:
+        if table_name in completed_tables:
+            print(f"  {table_name}: already loaded, skipped (resume)")
+            return
+        sql = table_sql(cfg, table_name, target_ids=target_ids)
+        print(f"  {table_name}: fetching from cluster")
+        frame = stamp_cluster_namespace(
+            fetch_frame(cfg, cfg.primary_database, sql, stage=table_name), cfg
+        )
+        write_tmp_table(duckdb_path, table_name, frame, snapshot_id, table_sql(cfg, table_name), args.lock_wait_seconds)
+
+    print("\n== Phase 1: root query tables ==")
+    for table_name in ROOT_ORDER:
+        capture(table_name)
+
+    print("\n== Phase 2: representative parent patterns ==")
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        target_ids = compute_parent_target_ids(
+            con, snapshot_id, cfg.evidence_parent_limit, cfg.floor_basis,
+            tmp_name("query_history"), tmp_name("query_text"),
+        ) or None
+    finally:
+        con.close()
+    if target_ids:
+        print(f"  {len(target_ids)} representative parent query id(s) selected")
+    else:
+        print("  No parents resolved; evidence tables fall back to live threshold selection")
+
+    print("\n== Phase 3: evidence tables ==")
+    for table_name in EXTRACTIONS:
+        if table_name not in ROOT_TABLE_SET:
+            capture(table_name)
+
+    print("\n== Phase 4: per-database catalog tables ==")
+    catalog_pending = [
+        t for t in ("svv_table_info_all", "external_table_info_all", "view_definitions", "procedure_definitions")
+        if t not in completed_tables
+    ]
+    for table_name in ("svv_table_info_all", "external_table_info_all", "view_definitions", "procedure_definitions"):
+        if table_name not in catalog_pending:
+            print(f"  {table_name}: already loaded, skipped (resume)")
+    if catalog_pending:
+        table_databases = resolve_table_databases(cfg)
+
+    if "svv_table_info_all" in catalog_pending:
+        frames = []
+        for database in table_databases:
+            frame = fetch_frame(cfg, database, TABLE_INFO_SQL, stage=f"svv_table_info_all [{database}]")
+            frame["source_db"] = database
+            frame = stamp_cluster_namespace(frame, cfg)
+            frames.append(frame)
+            print(f"  svv_table_info_all [{database}]: {len(frame):,} rows fetched")
+        table_info = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        write_tmp_table(duckdb_path, "svv_table_info_all", table_info, snapshot_id, TABLE_INFO_SQL, args.lock_wait_seconds)
+
+    if "view_definitions" in catalog_pending:
+        frames = []
+        for database in table_databases:
+            frame = fetch_frame(cfg, database, VIEW_DEFINITIONS_SQL, stage=f"view_definitions [{database}]")
+            frames.append(stamp_cluster_namespace(normalize_view_definitions(frame, database), cfg))
+            print(f"  view_definitions [{database}]: {len(frame):,} rows fetched")
+        view_defs = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        write_tmp_table(duckdb_path, "view_definitions", view_defs, snapshot_id, VIEW_DEFINITIONS_SQL, args.lock_wait_seconds)
+
+    if "procedure_definitions" in catalog_pending:
+        frames = []
+        for database in table_databases:
+            frame = fetch_frame(cfg, database, PROCEDURE_DEFINITIONS_SQL, stage=f"procedure_definitions [{database}]")
+            frames.append(stamp_cluster_namespace(normalize_procedure_definitions(frame, database), cfg))
+            print(f"  procedure_definitions [{database}]: {len(frame):,} rows fetched")
+        procedure_defs = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        write_tmp_table(duckdb_path, "procedure_definitions", procedure_defs, snapshot_id, PROCEDURE_DEFINITIONS_SQL, args.lock_wait_seconds)
+
+    # External metadata is intentionally the last phase.  Every normal query,
+    # catalog, view, and procedure table is already safe in *_tmp before any
+    # potentially slow Spectrum metadata view is touched.
+    if "external_table_info_all" in catalog_pending:
+        print("\n== FINAL PHASE: optional external-table metadata ==")
+        frames = []
+        prior_timeout = int(getattr(cfg, "statement_timeout_ms", 0) or 0)
+        cfg.statement_timeout_ms = 600_000
+        try:
+            for database in table_databases:
+                print(f"  external_table_info_all [{database}]: independent source staging")
+                catalog = fetch_external_stage(
+                    cfg, database, EXTERNAL_CATALOG_STAGE_SQL,
+                    stage=f"external catalog [{database}]",
+                )
+                segments = fetch_external_stage(
+                    cfg, database, external_segments_stage_sql(args.days),
+                    stage=f"external scan segments [{database}]",
+                )
+                if catalog.empty:
+                    catalog = minimal_external_catalog_from_segments(segments, database)
+                query_ids = external_query_ids(segments)
+                history = pd.DataFrame({
+                    "query_id": query_ids,
+                    "database_name": [database] * len(query_ids),
+                })
+                batch_size = 100
+                step_frames = []
+                for offset in range(0, len(query_ids), batch_size):
+                    batch = query_ids[offset:offset + batch_size]
+                    step_frames.append(fetch_external_stage(
+                        cfg, database, external_steps_stage_sql(batch),
+                        stage=f"external output metrics [{database}; {offset + 1}-{offset + len(batch)}]",
+                    ))
+                columns = fetch_external_stage(
+                    cfg, database, EXTERNAL_COLUMN_STATS_STAGE_SQL,
+                    stage=f"external partition keys [{database}]",
+                )
+                staged = {
+                    "svv_external_tables": catalog,
+                    "external_column_stats": columns,
+                    "sys_query_history": history,
+                    "sys_external_query_detail": segments,
+                    "sys_query_detail": pd.concat(step_frames, ignore_index=True) if step_frames else pd.DataFrame(),
+                    "sys_external_query_error": pd.DataFrame(),
+                }
+                frame = assemble_external_table_info(staged)
+                frame = stamp_cluster_namespace(frame, cfg)
+                frames.append(frame)
+                print(f"  external_table_info_all [{database}]: {len(frame):,} rows assembled locally")
+        finally:
+            cfg.statement_timeout_ms = prior_timeout
+        external_info = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not external_info.empty and "external_table_key" in external_info.columns:
+            external_info = external_info.drop_duplicates("external_table_key", keep="first")
+        write_tmp_table(
+            duckdb_path,
+            "external_table_info_all",
+            external_info,
+            snapshot_id,
+            "-- Final external stage; independent Redshift sources; local DuckDB joins\n"
+            + external_segments_stage_sql(args.days),
+            args.lock_wait_seconds,
+        )
+
+    save_state(duckdb_path, args.lock_wait_seconds, {"status": "loaded", "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+    print(
+        "\nDone. All *_tmp tables are loaded; the application never left its live data."
+        "\nPreserve the completed load before promotion:"
+        f"\n\n    {runner_command('--backup-only', '--duckdb-path', duckdb_path)}"
+        "\n\nThen promote it (takes seconds):"
+        f"\n\n    {runner_command('--swap', '--duckdb-path', duckdb_path)}\n"
+    )
+    return 0
+
+
+def _record_tmp_cluster_registry(duckdb_path: Path, lock_wait: float, snapshot_id: str, configs) -> None:
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS _tmp_snapshot_cluster_runs "
+            "(snapshot_id VARCHAR, namespace_id VARCHAR, cluster_role VARCHAR, cluster_name VARCHAR, cluster_host VARCHAR, "
+            "primary_database VARCHAR, captured_at TIMESTAMP)"
+        )
+        tmp_registry_columns = {
+            str(row[1]).lower()
+            for row in con.execute("PRAGMA table_info('_tmp_snapshot_cluster_runs')").fetchall()
+        }
+        if "cluster_name" not in tmp_registry_columns:
+            con.execute("ALTER TABLE _tmp_snapshot_cluster_runs ADD COLUMN cluster_name VARCHAR")
+        con.execute("DELETE FROM _tmp_snapshot_cluster_runs WHERE snapshot_id = ?", [snapshot_id])
+        for cfg in configs:
+            con.execute(
+                "INSERT INTO _tmp_snapshot_cluster_runs "
+                "(snapshot_id, namespace_id, cluster_role, cluster_name, cluster_host, primary_database, captured_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [snapshot_id, cfg.namespace_id, cfg.cluster_role, cfg.cluster_name, cfg.host, cfg.primary_database, datetime.now()],
+            )
+    finally:
+        con.close()
+
+
+def _resolve_multi_run(args, duckdb_path: Path, configs) -> tuple[str, dict[tuple[str, str], int]]:
+    """Return resumable snapshot plus completed namespace/table row counts."""
+    namespace_ids = ",".join(cfg.namespace_id for cfg in configs)
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        _ensure_stash_tables(con)
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {NAMESPACE_STATE_TABLE} "
+            "(snapshot_id VARCHAR, namespace_id VARCHAR, table_name VARCHAR, source_rows BIGINT, "
+            "status VARCHAR, completed_at TIMESTAMP, PRIMARY KEY (snapshot_id, namespace_id, table_name))"
+        )
+        state = read_state(con)
+        resumable = (
+            bool(args.resume)
+            and state.get("status") == "loading"
+            and bool(state.get("snapshot_id"))
+            and state.get("days") == str(args.days)
+            and state.get("floor_seconds") == str(args.floor_seconds)
+            and state.get("floor_basis") == args.floor_basis
+            and state.get("namespace_ids") == namespace_ids
+        )
+        if resumable:
+            snapshot_id = state["snapshot_id"]
+            prior_catalog_scope = str(
+                state.get("catalog_database_scope") or ""
+            ).strip()
+            if prior_catalog_scope != CATALOG_DATABASE_SCOPE_KEY:
+                print(
+                    "Catalog database policy changed from "
+                    f"{prior_catalog_scope or 'automatic discovery'} to "
+                    f"{CATALOG_DATABASE_SCOPE_KEY}; preserving workload "
+                    "checkpoints and invalidating only database-cycled "
+                    "catalog checkpoints."
+                )
+                catalog_names = tuple(sorted(DATABASE_CYCLED_TABLES))
+                placeholders = ", ".join("?" for _ in catalog_names)
+                con.execute(
+                    f"DELETE FROM {NAMESPACE_STATE_TABLE} "
+                    f"WHERE snapshot_id = ? AND table_name IN ({placeholders})",
+                    [snapshot_id, *catalog_names],
+                )
+                con.execute(
+                    f"DELETE FROM {SQL_STASH_TABLE} "
+                    f"WHERE table_name IN ({placeholders})",
+                    list(catalog_names),
+                )
+                for table_name in catalog_names:
+                    con.execute(
+                        f"DROP TABLE IF EXISTS "
+                        f"{quote_ident(tmp_name(table_name))}"
+                    )
+            rows = con.execute(
+                f"SELECT namespace_id, table_name, source_rows FROM {NAMESPACE_STATE_TABLE} "
+                "WHERE snapshot_id = ? AND status = 'complete'",
+                [snapshot_id],
+            ).fetchall()
+            completed = {(str(ns).lower(), str(table)): int(count or 0) for ns, table, count in rows}
+            print(f"Resuming namespaced snapshot {snapshot_id}: {len(completed)} table checkpoint(s) complete.")
+            return snapshot_id, completed
+        if args.resume and state.get("status") == "loading":
+            print("Existing staged load does not match the current namespaces/window; starting a new staged snapshot.")
+        # A new snapshot must start with an empty staging area. Parallel loads
+        # append namespace slices into shared *_tmp tables, so retaining even
+        # one table from an older snapshot would mix snapshot IDs and make a
+        # fully completed load impossible to promote.
+        for table_name in LIVE_REFRESH_TABLES:
+            con.execute(f"DROP TABLE IF EXISTS {quote_ident(tmp_name(table_name))}")
+        con.execute("DROP TABLE IF EXISTS _tmp_snapshot_cluster_runs")
+        con.execute(f"DELETE FROM {STATE_TABLE}")
+        con.execute(f"DELETE FROM {SQL_STASH_TABLE}")
+        con.execute(f"DELETE FROM {NAMESPACE_STATE_TABLE}")
+        return str(uuid.uuid4()), {}
+    finally:
+        con.close()
+
+
+def _mark_namespace_table_complete(
+    duckdb_path: Path, lock_wait: float, snapshot_id: str,
+    namespace_id: str, table_name: str, source_rows: int,
+) -> None:
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        con.execute(
+            f"INSERT OR REPLACE INTO {NAMESPACE_STATE_TABLE} "
+            "(snapshot_id, namespace_id, table_name, source_rows, status, completed_at) "
+            "VALUES (?, ?, ?, ?, 'complete', ?)",
+            [snapshot_id, namespace_id, table_name, int(source_rows), datetime.now()],
+        )
+    finally:
+        con.close()
+
+
+def _clear_staged_namespace_rows(duckdb_path: Path, lock_wait: float, table_name: str, namespace_id: str) -> None:
+    """Remove an uncheckpointed namespace slice before retry to prevent duplicates."""
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        target = tmp_name(table_name)
+        exists = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE LOWER(table_name) = LOWER(?)",
+            [target],
+        ).fetchone()[0]
+        if exists:
+            with contextlib.suppress(Exception):
+                con.execute(
+                    f"DELETE FROM {quote_ident(target)} WHERE LOWER(namespace_id) = LOWER(?)",
+                    [namespace_id],
+                )
+    finally:
+        con.close()
+
+
+class LoadCatalog:
+    """Thread-safe record of everything that failed to load during a run.
+
+    The one-button loader never halts on a per-table or per-cluster failure:
+    each problem is appended here and the run continues. A non-empty catalog
+    blocks auto-promotion (a partial load must never silently overwrite live
+    production data) and is written to disk as load_report.json + .txt.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.failures: list[dict] = []
+
+    def record(self, namespace_id: str, table_name: str, scope: str, error: BaseException) -> None:
+        with self._lock:
+            self.failures.append({
+                "namespace_id": namespace_id,
+                "table": table_name,
+                "scope": scope,
+                "error_type": type(error).__name__,
+                "error": _redact_for_catalog(error),
+            })
+
+    @property
+    def ok(self) -> bool:
+        with self._lock:
+            return not self.failures
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return list(self.failures)
+
+
+def _redact_for_catalog(value: object) -> str:
+    try:
+        from analyzer.secrets_store import redact_sensitive_text
+
+        return redact_sensitive_text(str(value))
+    except Exception:
+        return str(value)
+
+
+def write_load_report(duckdb_path: Path, catalog: LoadCatalog, configs, snapshot_id: str) -> Path:
+    """Write load_report.json + load_report.txt next to the warehouse.
+
+    Returns the path of the human-readable .txt report. The catalog is the
+    end-of-run record the one-button loader promises: what loaded clean, and
+    every namespace/table that was skipped, without ever halting the run.
+    """
+    out_dir = Path(duckdb_path).resolve().parent
+    failures = catalog.snapshot()
+    cluster_labels = [
+        getattr(cfg, "cluster_name", None) or getattr(cfg, "namespace_id", "?")
+        for cfg in configs
+    ]
+    finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "snapshot_id": snapshot_id,
+        "finished_at": finished_at,
+        "duckdb_path": str(duckdb_path),
+        "clusters": cluster_labels,
+        "clean": not failures,
+        "failure_count": len(failures),
+        "external_table_metadata": "included from producer SVV_EXTERNAL_COLUMNS",
+        "legacy_external_telemetry": "excluded this version",
+        "failures": failures,
+    }
+    json_path = out_dir / "load_report.json"
+    txt_path = out_dir / "load_report.txt"
+    with contextlib.suppress(Exception):
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines = [
+        "Databa6ix one-button load report",
+        f"Finished: {finished_at}",
+        f"Snapshot: {snapshot_id}",
+        f"Warehouse: {duckdb_path}",
+        f"Clusters attempted: {', '.join(cluster_labels) or '(none)'}",
+        "External table metadata: included from producer SVV_EXTERNAL_COLUMNS",
+        "Legacy external telemetry: excluded this version",
+        "",
+    ]
+    if not failures:
+        lines.append("RESULT: CLEAN — every configured namespace/table loaded. Safe to promote.")
+    else:
+        lines.append(f"RESULT: {len(failures)} item(s) did NOT load (loading continued past each):")
+        lines.append("")
+        for item in failures:
+            lines.append(
+                f"  - [{item['scope']}] {item['table']} @ {item['namespace_id']}: "
+                f"{item['error_type']}: {item['error']}"
+            )
+        lines.append("")
+        lines.append(
+            "Auto-promote was SKIPPED because the load is partial. Live data is untouched.\n"
+            "Fix the sources above and resume the safe load. Completed checkpoints are\n"
+            "reused; promotion remains blocked until every required checkpoint succeeds."
+        )
+    with contextlib.suppress(Exception):
+        txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return txt_path
+
+
+def _redshift_read_worker_count(configs) -> int:
+    """Return a conservative direct-Redshift reader count.
+
+    ``redshift_connector`` calls are blocking, so independent cluster reads
+    overlap efficiently in threads. A worker never receives a connection
+    created by another worker: ``fetch_frame`` opens and closes its own
+    connection for every query. DuckDB writes remain protected by the one
+    writer lock in ``run_multi_load``.
+    """
+    cluster_count = max(1, len(configs))
+    enabled = str(
+        os.environ.get("DATABA6IX_PARALLEL_LOAD", "1")
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled or cluster_count == 1:
+        return 1
+    try:
+        requested = int(
+            str(os.environ.get("DATABA6IX_REDSHIFT_READ_WORKERS", "4")).strip()
+        )
+    except (TypeError, ValueError):
+        requested = 4
+    # Four is the operational default; eight is the hard safety ceiling.
+    return min(cluster_count, max(1, min(requested, 8)))
+
+
+def run_multi_load(args, configs) -> int:
+    """Capture producer and consumers into one namespaced staging snapshot.
+
+    When more than one cluster is enabled, captures run **in parallel** using
+    a conservative direct-reader pool. Redshift I/O overlaps through separate
+    per-worker connections; DuckDB writes are serialized with a lock so a
+    single warehouse file stays consistent.
+
+    This is the one-button pipeline: it never halts on a per-table or
+    per-cluster failure. Each problem is recorded in a LoadCatalog and the
+    run continues to the end; a non-empty catalog then blocks auto-promotion
+    so a partial load can never silently overwrite live production data.
+    """
+    duckdb_path = Path(args.duckdb_path)
+    refresh_plan = selected_refresh_tables(args)
+    refresh_set = set(refresh_plan)
+    snapshot_id, completed_tables = _resolve_multi_run(args, duckdb_path, configs)
+    workers = _redshift_read_worker_count(configs)
+    parallel = workers > 1
+    print(f"== Multi-cluster refresh: {len(configs)} cluster(s), one namespaced snapshot ==")
+    print(
+        f"== Direct Redshift readers: {workers} "
+        "(separate connections; DuckDB writes serialized) =="
+        if parallel
+        else "== Direct Redshift readers: 1 (sequential cluster load) =="
+    )
+    print(f"== Target file: {duckdb_path} (writes go to *_tmp tables only) ==\n")
+    save_state(
+        duckdb_path,
+        args.lock_wait_seconds,
+        {
+            "snapshot_id": snapshot_id,
+            "label": "multi-cluster tmp refresh",
+            "days": str(args.days),
+            "floor_seconds": str(args.floor_seconds),
+            "floor_basis": args.floor_basis,
+            "catalog_database_scope": CATALOG_DATABASE_SCOPE_KEY,
+            "status": "loading",
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "namespace_ids": ",".join(cfg.namespace_id for cfg in configs),
+            "parallel_workers": str(workers),
+            "selected_tables": ",".join(refresh_plan),
+            "failure_count": "0",
+            "load_report": "",
+        },
+    )
+    _record_tmp_cluster_registry(duckdb_path, args.lock_wait_seconds, snapshot_id, configs)
+    external_checkpoints = {
+        namespace_id for (namespace_id, table_name) in completed_tables
+        if table_name == "external_table_info_all"
+    }
+    if "external_table_info_all" in refresh_set and not external_checkpoints:
+        con = open_duck(duckdb_path, args.lock_wait_seconds)
+        try:
+            con.execute(f"DROP TABLE IF EXISTS {quote_ident(tmp_name('external_table_info_all'))}")
+        finally:
+            con.close()
+
+    # A checked/empty-table refresh must never promote a stale *_tmp table
+    # left by an older, wider plan. Live production tables are untouched.
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        for table_name in LIVE_REFRESH_TABLES:
+            if table_name not in refresh_set:
+                con.execute(f"DROP TABLE IF EXISTS {quote_ident(tmp_name(table_name))}")
+    finally:
+        con.close()
+
+    progress_tables = list(refresh_plan)
+    per_cluster_tables = [
+        table for table in progress_tables
+        if table != "external_table_metadata"
+    ]
+    progress_total = max(
+        1,
+        len(per_cluster_tables) * len(configs)
+        + (1 if "external_table_metadata" in refresh_set else 0),
+    )
+    progress_completed = 0
+    progress_lock = threading.Lock()
+    write_lock = threading.RLock()
+    load_catalog = LoadCatalog()
+    if (
+        "external_table_metadata" in refresh_set
+        and not any(
+            str(getattr(cfg, "cluster_role", "")).lower() == "producer"
+            for cfg in configs
+        )
+    ):
+        load_catalog.record(
+            "producer",
+            "external_table_metadata",
+            "catalog",
+            RuntimeError(
+                "External table metadata requires an enabled Producer profile."
+            ),
+        )
+
+    def bump_progress() -> int:
+        nonlocal progress_completed
+        with progress_lock:
+            progress_completed += 1
+            return progress_completed
+
+    def _capture_catalog_tables(cfg, pending_catalogs, append) -> None:
+        table_databases = resolve_table_databases(cfg) if pending_catalogs else ()
+        # Independent catalog datasets must be independent retry units. In the
+        # old block, a table-info or view failure aborted the function before
+        # Producer SVV_EXTERNAL_COLUMNS was attempted, so every Resume repeated
+        # the same failure loop. External metadata is intentionally first.
+        catalog_order = (
+            "external_table_metadata",
+            "svv_table_info_all",
+            "view_definitions",
+            "procedure_definitions",
+        )
+        frames_by_catalog = {
+            name: [] for name in catalog_order if name in pending_catalogs
+        }
+        sql_by_catalog = {
+            "external_table_metadata": EXTERNAL_TABLE_METADATA_SQL,
+            "svv_table_info_all": TABLE_INFO_SQL,
+            "view_definitions": VIEW_DEFINITIONS_SQL,
+            "procedure_definitions": PROCEDURE_DEFINITIONS_SQL,
+        }
+        failed_catalogs: set[str] = set()
+        not_applicable_catalogs: set[str] = set()
+
+        def consumer_catalog_database_not_present(
+            database: str, exc: BaseException,
+        ) -> bool:
+            """Recognize the fixed catalog DB being absent on a consumer.
+
+            The producer remains mandatory because it owns external metadata.
+            This exemption is deliberately limited to Redshift's invalid
+            catalog error for the one emergency-policy database.
+            """
+            if str(getattr(cfg, "cluster_role", "")).strip().lower() != "consumer":
+                return False
+            if str(database).strip().lower() not in {
+                value.lower() for value in CONSUMER_CATALOG_DATABASE_SCOPE
+            }:
+                return False
+            error = str(exc).lower()
+            return (
+                "3d000" in error
+                or (
+                    "database" in error
+                    and "enterprise_datawarehouse" in error
+                    and "does not exist" in error
+                )
+            )
+
+        def fail_catalog(catalog_name: str, exc: BaseException) -> None:
+            if catalog_name in failed_catalogs:
+                return
+            failed_catalogs.add(catalog_name)
+            load_catalog.record(
+                cfg.namespace_id, catalog_name, "catalog", exc,
+            )
+            done = bump_progress()
+            print(
+                f"  !! SKIP {catalog_name} [{cfg.namespace_id}]: {exc}",
+                flush=True,
+            )
+            emit_progress(
+                cfg.namespace_id,
+                catalog_name,
+                0,
+                0,
+                done,
+                progress_total,
+                f"Retry required — {exc}",
+            )
+
+        successful_catalog_databases: set[str] = set()
+        skipped_producer_databases: list[tuple[str, str]] = []
+        for database in table_databases:
+            database_frames: dict[str, object] = {}
+            skip_producer_database = False
+            for catalog_name in catalog_order:
+                if (
+                    catalog_name not in frames_by_catalog
+                    or catalog_name in failed_catalogs
+                ):
+                    continue
+                action = (
+                    "Retrying missing checkpoint"
+                    if args.resume and completed_tables
+                    else "Loading"
+                )
+                emit_progress(
+                    cfg.namespace_id,
+                    catalog_name,
+                    0,
+                    0,
+                    progress_completed,
+                    progress_total,
+                    f"{action} from {database}",
+                )
+                try:
+                    if catalog_name == "external_table_metadata":
+                        frame = fetch_frame(
+                            cfg,
+                            database,
+                            EXTERNAL_TABLE_METADATA_SQL,
+                            stage=(
+                                "external table metadata "
+                                f"[{cfg.namespace_id}/{database}]"
+                            ),
+                        )
+                        frame["source_db"] = database
+                    elif catalog_name == "svv_table_info_all":
+                        frame = fetch_frame(
+                            cfg,
+                            database,
+                            TABLE_INFO_SQL,
+                            stage=f"table info [{cfg.namespace_id}/{database}]",
+                        )
+                        frame["source_db"] = database
+                    elif catalog_name == "view_definitions":
+                        frame = normalize_view_definitions(
+                            fetch_frame(
+                                cfg,
+                                database,
+                                VIEW_DEFINITIONS_SQL,
+                                stage=f"views [{cfg.namespace_id}/{database}]",
+                            ),
+                            database,
+                        )
+                    else:
+                        frame = normalize_procedure_definitions(
+                            fetch_frame(
+                                cfg,
+                                database,
+                                PROCEDURE_DEFINITIONS_SQL,
+                                stage=f"procedures [{cfg.namespace_id}/{database}]",
+                            ),
+                            database,
+                        )
+                    database_frames[catalog_name] = stamp_cluster_namespace(
+                        frame, cfg
+                    )
+                except BaseException as exc:  # noqa: BLE001 — isolate each catalog
+                    if consumer_catalog_database_not_present(database, exc):
+                        # A consumer without the fixed EDW database has no
+                        # applicable catalog rows. Checkpoint every still-
+                        # pending consumer catalog as a successful zero-row
+                        # result and do not open two more doomed connections.
+                        not_applicable_catalogs.update(
+                            name
+                            for name, frames in frames_by_catalog.items()
+                            if name != "external_table_metadata"
+                            and not frames
+                            and name not in failed_catalogs
+                        )
+                        print(
+                            "  -- Consumer catalog database is not present "
+                            f"[{cfg.namespace_id}/{database}]; "
+                            "remaining consumer catalog datasets are "
+                            "successful zero-row checkpoints.",
+                            flush=True,
+                        )
+                        break
+                    if (
+                        str(getattr(cfg, "cluster_role", "")).strip().lower()
+                        == "producer"
+                        and str(database).strip().lower() in {
+                            value.lower()
+                            for value in PRODUCER_CATALOG_DATABASE_SCOPE
+                        }
+                    ):
+                        # The operator's fixed Producer list can include data
+                        # shares that are not connectable Redshift databases.
+                        # Treat an error for one named entry as a whole-entry
+                        # skip, discard any partial frames from it, and advance.
+                        error_summary = str(exc).replace("\r", " ").replace(
+                            "\n", " "
+                        ).strip()
+                        skipped_producer_databases.append(
+                            (str(database), error_summary)
+                        )
+                        skip_producer_database = True
+                        print(
+                            "  -- SKIP producer entry "
+                            f"{database}: unavailable or data share; "
+                            f"continuing. Detail: {error_summary}",
+                            flush=True,
+                        )
+                        emit_progress(
+                            cfg.namespace_id,
+                            catalog_name,
+                            0,
+                            0,
+                            progress_completed,
+                            progress_total,
+                            f"Skipped {database} — unavailable or data share",
+                        )
+                        break
+                    fail_catalog(catalog_name, exc)
+            if not_applicable_catalogs:
+                break
+            if skip_producer_database:
+                continue
+            for catalog_name, frame in database_frames.items():
+                frames_by_catalog[catalog_name].append(frame)
+            if database_frames:
+                successful_catalog_databases.add(str(database))
+
+        if (
+            str(getattr(cfg, "cluster_role", "")).strip().lower() == "producer"
+            and frames_by_catalog
+            and not successful_catalog_databases
+            and skipped_producer_databases
+        ):
+            skipped_names = ", ".join(
+                database for database, _error in skipped_producer_databases
+            )
+            for catalog_name in frames_by_catalog:
+                fail_catalog(
+                    catalog_name,
+                    RuntimeError(
+                        "No explicit Producer catalog database could be read; "
+                        f"skipped: {skipped_names}"
+                    ),
+                )
+
+        for catalog_name in catalog_order:
+            if (
+                catalog_name not in frames_by_catalog
+                or catalog_name in failed_catalogs
+            ):
+                continue
+            frames = frames_by_catalog[catalog_name]
+            try:
+                if args.resume:
+                    with write_lock:
+                        _clear_staged_namespace_rows(
+                            duckdb_path,
+                            args.lock_wait_seconds,
+                            catalog_name,
+                            cfg.namespace_id,
+                        )
+                rows = sum(len(frame) for frame in frames)
+                with write_lock:
+                    write_tmp_table(
+                        duckdb_path,
+                        catalog_name,
+                        (
+                            pd.concat(frames, ignore_index=True)
+                            if frames
+                            else pd.DataFrame()
+                        ),
+                        snapshot_id,
+                        sql_by_catalog[catalog_name],
+                        args.lock_wait_seconds,
+                        append=append,
+                    )
+                    _mark_namespace_table_complete(
+                        duckdb_path,
+                        args.lock_wait_seconds,
+                        snapshot_id,
+                        cfg.namespace_id,
+                        catalog_name,
+                        rows,
+                    )
+            except BaseException as exc:  # noqa: BLE001 — isolate each catalog
+                fail_catalog(catalog_name, exc)
+                continue
+            done = bump_progress()
+            emit_progress(
+                cfg.namespace_id,
+                catalog_name,
+                rows,
+                rows,
+                done,
+                progress_total,
+                (
+                    CONSUMER_CATALOG_DATABASE_NOT_PRESENT_STATUS
+                    if catalog_name in not_applicable_catalogs
+                    else "Staged in DuckDB"
+                ),
+            )
+
+    def load_one_cluster(profile_index: int, cfg) -> None:
+        # Parallel clusters always append into shared *_tmp tables (namespace-stamped).
+        # Sequential mode keeps historical first-cluster rebuild behavior.
+        append = parallel or profile_index > 0
+        no_qualifying_queries = (
+            completed_tables.get((cfg.namespace_id.lower(), "query_history"))
+            == 0
+        )
+        label = cfg.cluster_name or f"{cfg.cluster_role} {cfg.cluster_ordinal or ''}".strip()
+        print(f"\n## START {label}: namespace {cfg.namespace_id} ##", flush=True)
+        pending_primary_tables = {
+            table_name
+            for table_name in QUERY_EVIDENCE_TABLES
+            if (
+                table_name in refresh_set
+                and (cfg.namespace_id.lower(), table_name)
+                not in completed_tables
+            )
+        }
+        primary_validation_error: BaseException | None = None
+        if pending_primary_tables:
+            try:
+                validate_primary_sources(cfg)
+            except BaseException as exc:  # noqa: BLE001 — catalogs remain independent
+                primary_validation_error = exc
+                print(
+                    f"!! Workload source validation failed for {label} "
+                    f"[{cfg.namespace_id}]; independent catalog retries will "
+                    f"continue: {exc}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"  No workload checkpoints pending for {cfg.namespace_id}; "
+                "independent catalog retries continue without workload validation.",
+                flush=True,
+            )
+
+        def capture(table_name: str, target_ids=None) -> None:
+            nonlocal no_qualifying_queries
+            checkpoint = completed_tables.get((cfg.namespace_id.lower(), table_name))
+            if checkpoint is not None:
+                if table_name == "query_history" and checkpoint == 0:
+                    no_qualifying_queries = True
+                done = bump_progress()
+                print(f"  {table_name} [{cfg.namespace_id}]: checkpoint complete, skipped", flush=True)
+                checkpoint_status = (
+                    NO_QUALIFYING_QUERY_STATUS
+                    if (
+                        no_qualifying_queries
+                        and checkpoint == 0
+                        and table_name in QUERY_EVIDENCE_TABLES
+                    )
+                    else "Recovered checkpoint"
+                )
+                emit_progress(
+                    cfg.namespace_id, table_name, checkpoint, checkpoint,
+                    done, progress_total, checkpoint_status,
+                )
+                return
+            if primary_validation_error is not None:
+                load_catalog.record(
+                    cfg.namespace_id,
+                    table_name,
+                    "table",
+                    primary_validation_error,
+                )
+                done = bump_progress()
+                emit_progress(
+                    cfg.namespace_id,
+                    table_name,
+                    0,
+                    0,
+                    done,
+                    progress_total,
+                    f"Retry required — source validation: "
+                    f"{primary_validation_error}",
+                )
+                return
+            emit_progress(
+                cfg.namespace_id, table_name, 0, 0,
+                progress_completed, progress_total, "Loading from Redshift",
+            )
+            try:
+                # Redshift fetch outside the DuckDB write lock so clusters overlap.
+                if args.resume:
+                    with write_lock:
+                        _clear_staged_namespace_rows(
+                            duckdb_path, args.lock_wait_seconds, table_name, cfg.namespace_id
+                        )
+                sql = table_sql(cfg, table_name, target_ids=target_ids)
+                frame = stamp_cluster_namespace(
+                    fetch_frame(cfg, cfg.primary_database, sql, stage=f"{table_name} [{cfg.namespace_id}]"), cfg
+                )
+                with write_lock:
+                    write_tmp_table(
+                        duckdb_path, table_name, frame, snapshot_id, sql,
+                        args.lock_wait_seconds, append=append,
+                    )
+                    _mark_namespace_table_complete(
+                        duckdb_path, args.lock_wait_seconds, snapshot_id,
+                        cfg.namespace_id, table_name, len(frame),
+                    )
+                if table_name == "query_history" and frame.empty:
+                    # Zero threshold-qualified roots is a valid consumer
+                    # outcome. Its empty evidence checkpoints are complete,
+                    # promotable, and deliberately shown as yellow in the UI.
+                    no_qualifying_queries = True
+            except BaseException as exc:  # noqa: BLE001 — never halt; record and move on
+                load_catalog.record(cfg.namespace_id, table_name, "table", exc)
+                done = bump_progress()
+                print(f"  !! SKIP {table_name} [{cfg.namespace_id}]: {exc}", flush=True)
+                emit_progress(
+                    cfg.namespace_id, table_name, 0, 0,
+                    done, progress_total, f"Skipped after error: {exc}",
+                )
+                return
+            done = bump_progress()
+            completion_status = (
+                NO_QUALIFYING_QUERY_STATUS
+                if (
+                    no_qualifying_queries
+                    and frame.empty
+                    and table_name in QUERY_EVIDENCE_TABLES
+                )
+                else "Staged in DuckDB"
+            )
+            emit_progress(
+                cfg.namespace_id, table_name, len(frame), len(frame),
+                done, progress_total, completion_status,
+            )
+
+        for table_name in ROOT_ORDER:
+            if table_name in refresh_set:
+                capture(table_name)
+
+        target_ids = None
+        if {"query_history", "query_text"} <= refresh_set:
+            try:
+                with write_lock:
+                    con = open_duck(duckdb_path, args.lock_wait_seconds)
+                    try:
+                        target_ids = compute_parent_target_ids(
+                            con, snapshot_id, cfg.evidence_parent_limit, cfg.floor_basis,
+                            tmp_name("query_history"), tmp_name("query_text"), cfg.namespace_id,
+                        ) or None
+                    finally:
+                        con.close()
+                print(f"  {len(target_ids or [])} representative parent query id(s) for namespace {cfg.namespace_id}", flush=True)
+            except BaseException as exc:  # noqa: BLE001 — degrade to no target ids, keep loading
+                load_catalog.record(cfg.namespace_id, "(representative parent ids)", "cluster", exc)
+                target_ids = None
+                print(f"  !! parent-id computation failed [{cfg.namespace_id}], continuing without it: {exc}", flush=True)
+        for table_name in EXTRACTIONS:
+            if table_name not in ROOT_TABLE_SET and table_name in refresh_set:
+                capture(table_name, target_ids)
+
+        catalog_candidates = []
+        if (
+            str(getattr(cfg, "cluster_role", "")).lower() == "producer"
+            and "external_table_metadata" in refresh_set
+        ):
+            catalog_candidates.append("external_table_metadata")
+        catalog_candidates.extend(
+            ("svv_table_info_all", "view_definitions", "procedure_definitions")
+        )
+        catalog_names = tuple(
+            name for name in catalog_candidates if name in refresh_set
+        )
+        for catalog_name in catalog_names:
+            checkpoint = completed_tables.get((cfg.namespace_id.lower(), catalog_name))
+            if checkpoint is not None:
+                done = bump_progress()
+                emit_progress(
+                    cfg.namespace_id, catalog_name, checkpoint, checkpoint,
+                    done, progress_total, "Recovered checkpoint",
+                )
+        pending_catalogs = {
+            name for name in catalog_names
+            if (cfg.namespace_id.lower(), name) not in completed_tables
+        }
+        _capture_catalog_tables(cfg, pending_catalogs, append)
+        print(f"## DONE {label}: namespace {cfg.namespace_id} ##", flush=True)
+
+    if parallel:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cluster-load") as pool:
+            futures = {
+                pool.submit(load_one_cluster, index, cfg): cfg
+                for index, cfg in enumerate(configs)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                cfg = futures[future]
+                try:
+                    future.result()
+                except BaseException as exc:  # noqa: BLE001 — never halt; catalog and continue
+                    label = getattr(cfg, "cluster_name", None) or getattr(cfg, "namespace_id", "?")
+                    print(f"!! Cluster failed ({label}): {exc}", flush=True)
+                    load_catalog.record(getattr(cfg, "namespace_id", "?"), "(whole cluster)", "cluster", exc)
+    else:
+        for profile_index, cfg in enumerate(configs):
+            try:
+                load_one_cluster(profile_index, cfg)
+            except BaseException as exc:  # noqa: BLE001 — never halt; catalog and continue
+                label = getattr(cfg, "cluster_name", None) or getattr(cfg, "namespace_id", "?")
+                print(f"!! Cluster failed ({label}): {exc}", flush=True)
+                load_catalog.record(getattr(cfg, "namespace_id", "?"), "(whole cluster)", "cluster", exc)
+
+    if "external_table_info_all" in refresh_set:
+        print("\n== FINAL GLOBAL PHASE: external-table metadata for all namespaces ==")
+        print("All producer/consumer workload and catalog tables are already checkpointed.")
+    # External stage also runs in parallel across clusters (fetch-heavy).
+    def load_external_one(cfg) -> None:
+        nonlocal progress_completed
+        table_name = "external_table_info_all"
+        checkpoint = completed_tables.get((cfg.namespace_id.lower(), table_name))
+        if checkpoint is not None:
+            done = bump_progress()
+            emit_progress(
+                cfg.namespace_id, table_name, checkpoint, checkpoint,
+                done, progress_total, "Recovered checkpoint",
+            )
+            return
+        if args.resume:
+            with write_lock:
+                _clear_staged_namespace_rows(
+                    duckdb_path, args.lock_wait_seconds, table_name, cfg.namespace_id
+                )
+        databases = resolve_table_databases(cfg)
+        prior_timeout = int(getattr(cfg, "statement_timeout_ms", 0) or 0)
+        cfg.statement_timeout_ms = 600_000
+        namespace_frames = []
+        try:
+            for database in databases:
+                emit_progress(
+                    cfg.namespace_id, table_name, 0, 0,
+                    progress_completed, progress_total,
+                    f"External metadata: {database}",
+                )
+                catalog = fetch_external_stage(
+                    cfg, database, EXTERNAL_CATALOG_STAGE_SQL,
+                    stage=f"external catalog [{cfg.namespace_id}/{database}]",
+                )
+                segments = fetch_external_stage(
+                    cfg, database, external_segments_stage_sql(args.days),
+                    stage=f"external scan segments [{cfg.namespace_id}/{database}]",
+                )
+                if catalog.empty:
+                    catalog = minimal_external_catalog_from_segments(segments, database)
+                query_ids = external_query_ids(segments)
+                history = pd.DataFrame({
+                    "query_id": query_ids,
+                    "database_name": [database] * len(query_ids),
+                })
+                step_frames = []
+                for offset in range(0, len(query_ids), 100):
+                    batch = query_ids[offset:offset + 100]
+                    step_frames.append(fetch_external_stage(
+                        cfg, database, external_steps_stage_sql(batch),
+                        stage=(
+                            f"external output metrics [{cfg.namespace_id}/{database}; "
+                            f"{offset + 1}-{offset + len(batch)}]"
+                        ),
+                    ))
+                columns = fetch_external_stage(
+                    cfg, database, EXTERNAL_COLUMN_STATS_STAGE_SQL,
+                    stage=f"external partition keys [{cfg.namespace_id}/{database}]",
+                )
+                staged = {
+                    "svv_external_tables": catalog,
+                    "external_column_stats": columns,
+                    "sys_query_history": history,
+                    "sys_external_query_detail": segments,
+                    "sys_query_detail": pd.concat(step_frames, ignore_index=True) if step_frames else pd.DataFrame(),
+                    "sys_external_query_error": pd.DataFrame(),
+                }
+                namespace_frames.append(stamp_cluster_namespace(
+                    assemble_external_table_info(staged), cfg
+                ))
+        finally:
+            cfg.statement_timeout_ms = prior_timeout
+        external_info = (
+            pd.concat(namespace_frames, ignore_index=True)
+            if namespace_frames else pd.DataFrame()
+        )
+        with write_lock:
+            write_tmp_table(
+                duckdb_path, table_name, external_info, snapshot_id,
+                "-- Final global external stage; independent sources; local DuckDB joins\n"
+                + external_segments_stage_sql(args.days),
+                args.lock_wait_seconds, append=True,
+            )
+            _mark_namespace_table_complete(
+                duckdb_path, args.lock_wait_seconds, snapshot_id,
+                cfg.namespace_id, table_name, len(external_info),
+            )
+        done = bump_progress()
+        emit_progress(
+            cfg.namespace_id, table_name, len(external_info), len(external_info),
+            done, progress_total, "Staged in DuckDB",
+        )
+
+    if "external_table_info_all" in refresh_set:
+        if parallel:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="external-load") as pool:
+                list(pool.map(load_external_one, configs))
+        else:
+            for cfg in configs:
+                load_external_one(cfg)
+
+    report_path = write_load_report(duckdb_path, load_catalog, configs, snapshot_id)
+    failures = load_catalog.snapshot()
+
+    if failures:
+        # Partial load: leave status "loading" so run_swap's status=="loaded"
+        # gate blocks any auto-promotion. Live production data stays untouched.
+        # Checkpoints are preserved, so a rerun resumes and can still complete.
+        print(
+            f"\n== LOAD FINISHED WITH {len(failures)} SKIPPED ITEM(S) — nothing was halted ==\n"
+        )
+        for item in failures:
+            print(f"  - [{item['scope']}] {item['table']} @ {item['namespace_id']}: "
+                  f"{item['error_type']}: {item['error']}")
+        print(
+            f"\nFull catalog written to:\n    {report_path}\n"
+            "\nAuto-promote was SKIPPED (partial load never overwrites live data)."
+            "\nFix the sources above, then resume the safe load. Completed "
+            "checkpoints will be reused and promotion remains blocked until "
+            "every required checkpoint succeeds.\n"
+        )
+        save_state(
+            duckdb_path,
+            args.lock_wait_seconds,
+            {
+                "failure_count": str(len(failures)),
+                "load_report": str(report_path),
+            },
+        )
+        return 0
+
+    save_state(
+        duckdb_path, args.lock_wait_seconds,
+        {
+            "status": "loaded",
+            "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "failure_count": "0",
+            "load_report": str(report_path),
+        },
+    )
+    print(
+        "\nDone. CLEAN LOAD — every configured namespace/table staged in *_tmp tables."
+        f"\nReport: {report_path}"
+        f"\nPromote after review:\n\n    {runner_command('--swap', '--duckdb-path', duckdb_path)}\n"
+    )
+    return 0
+
+
+# ------------------------------------------------------------------ swap mode
+
+
+def _backup_file(duckdb_path: Path, lock_wait: float) -> Path:
+    con = open_duck(duckdb_path, lock_wait)
+    try:
+        con.execute("CHECKPOINT")
+    except Exception as exc:
+        raise SystemExit(
+            f"DuckDB CHECKPOINT failed; backup and promotion were aborted: {exc}"
+        ) from exc
+    finally:
+        con.close()
+    backup_dir = duckdb_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"{duckdb_path.stem}.before-tmp-swap.{stamp}{duckdb_path.suffix}"
+    shutil.copy2(duckdb_path, backup_path)
+    if backup_path.stat().st_size != duckdb_path.stat().st_size:
+        raise SystemExit(
+            f"Backup verification failed: {backup_path}. The swap has NOT started; keep the source file unchanged."
+        )
+    return backup_path
+
+
+def run_backup_only(args) -> int:
+    duckdb_path = Path(args.duckdb_path)
+    print("Creating a checkpointed preservation copy. No tables will be renamed or deleted ...")
+    backup_path = _backup_file(duckdb_path, args.lock_wait_seconds)
+    print(f"  source preserved: {duckdb_path}")
+    print(f"  backup verified:  {backup_path} ({backup_path.stat().st_size:,} bytes)")
+    print("\nBackup-only complete. The production and *_tmp tables were not changed.")
+    print(f"\nWhen ready, use:\n\n    {runner_command('--swap', '--duckdb-path', duckdb_path)}")
+    return 0
+
+
+def _snapshot_from_tmp(con, ready) -> str:
+    for table_name in ready:
+        try:
+            row = con.execute(
+                f"SELECT snapshot_id FROM {quote_ident(tmp_name(table_name))} "
+                "WHERE snapshot_id IS NOT NULL LIMIT 1"
+            ).fetchone()
+        except Exception:
+            continue
+        if row and row[0]:
+            return str(row[0])
+    return ""
+
+
+def staging_checkpoint_progress(con, state: dict, planned) -> tuple[int, int, list[str]]:
+    """Return completed count, required count, and missing checkpoint labels."""
+    snapshot_id = str(state.get("snapshot_id") or "").strip()
+    namespace_ids = {
+        value.strip().lower()
+        for value in str(state.get("namespace_ids") or "").split(",")
+        if value.strip()
+    }
+    if not snapshot_id:
+        return 0, 0, ["staging snapshot id is missing"]
+    if not namespace_ids:
+        return 0, 0, ["staging namespace list is missing"]
+    try:
+        completed = {
+            (str(namespace_id).strip().lower(), str(table_name).strip())
+            for namespace_id, table_name in con.execute(
+                f"SELECT namespace_id, table_name FROM {NAMESPACE_STATE_TABLE} "
+                "WHERE snapshot_id = ? AND status = 'complete'",
+                [snapshot_id],
+            ).fetchall()
+        }
+    except Exception:
+        return 0, 0, ["namespace checkpoint table is missing"]
+    try:
+        producer_namespaces = {
+            str(namespace_id).strip().lower()
+            for namespace_id, in con.execute(
+                "SELECT namespace_id FROM _tmp_snapshot_cluster_runs "
+                "WHERE snapshot_id = ? AND LOWER(cluster_role) = 'producer'",
+                [snapshot_id],
+            ).fetchall()
+            if str(namespace_id or "").strip()
+        }
+    except Exception:
+        producer_namespaces = set()
+
+    expected: set[tuple[str, str]] = set()
+    identity_gaps: list[str] = []
+    for table_name in planned:
+        expected_namespaces = (
+            producer_namespaces
+            if table_name == "external_table_metadata"
+            else namespace_ids
+        )
+        if not expected_namespaces:
+            identity_gaps.append(
+                f"{table_name}: producer checkpoint identity is missing"
+            )
+            continue
+        for namespace_id in sorted(expected_namespaces):
+            expected.add((namespace_id, table_name))
+    missing_pairs = sorted(expected - completed, key=lambda value: (value[1], value[0]))
+    gaps = identity_gaps + [
+        f"{table_name}: {namespace_id}"
+        for namespace_id, table_name in missing_pairs
+    ]
+    # An unresolved producer identity is itself one required checkpoint, so a
+    # broken profile can never appear as 100% complete.
+    total = len(expected) + len(identity_gaps)
+    done = len(expected & completed)
+    return done, total, gaps
+
+
+def _staging_checkpoint_gaps(con, state: dict, planned) -> list[str]:
+    """Return missing namespace checkpoints for an interrupted finalization."""
+    return staging_checkpoint_progress(con, state, planned)[2]
+
+
+def run_swap(args) -> int:
+    duckdb_path = Path(args.duckdb_path)
+    if not args.no_backup:
+        print("Backing up the DuckDB file before the swap ...")
+        print(f"  backup written: {_backup_file(duckdb_path, args.lock_wait_seconds)}")
+
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS snapshot_runs "
+            "(snapshot_id VARCHAR PRIMARY KEY, captured_at TIMESTAMP, label VARCHAR, source VARCHAR)"
+        )
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS analyzer_source_sql (table_name VARCHAR, snapshot_id VARCHAR, "
+            "sql_hash VARCHAR, sql_text VARCHAR, recorded_at TIMESTAMP, source VARCHAR, "
+            "PRIMARY KEY (table_name, snapshot_id))"
+        )
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS snapshot_cluster_runs "
+            "(snapshot_id VARCHAR, namespace_id VARCHAR, cluster_role VARCHAR, cluster_name VARCHAR, cluster_host VARCHAR, "
+            "primary_database VARCHAR, captured_at TIMESTAMP, "
+            "PRIMARY KEY (snapshot_id, namespace_id))"
+        )
+        registry_columns = {
+            str(row[1]).lower()
+            for row in con.execute("PRAGMA table_info('snapshot_cluster_runs')").fetchall()
+        }
+        if "cluster_name" not in registry_columns:
+            con.execute("ALTER TABLE snapshot_cluster_runs ADD COLUMN cluster_name VARCHAR")
+        state = read_state(con)
+        existing = {
+            str(row[0]).lower()
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+        selected_state = tuple(
+            value.strip() for value in str(state.get("selected_tables") or "").split(",")
+            if value.strip()
+        )
+        planned = selected_state or LIVE_REFRESH_TABLES
+        missing = [table for table in planned if tmp_name(table).lower() not in existing]
+        if missing and selected_state:
+            raise SystemExit(
+                "Staged load is incomplete; promotion was aborted. Missing: "
+                + ", ".join(f"{table}_tmp" for table in missing)
+            )
+        if state.get("status") != "loaded":
+            try:
+                failure_count = int(state.get("failure_count", "0") or 0)
+            except ValueError:
+                failure_count = 0
+            if failure_count:
+                raise SystemExit(
+                    f"The staged load has {failure_count} incomplete item(s); "
+                    "promotion was aborted and no live tables were changed. "
+                    "Resume the Databa6ix loader first."
+                )
+            gaps = _staging_checkpoint_gaps(con, state, planned)
+            if gaps:
+                raise SystemExit(
+                    "The staged load is not complete; promotion was aborted and "
+                    "no live tables were changed. Missing checkpoint(s): "
+                    + ", ".join(gaps[:12])
+                    + (f" and {len(gaps) - 12} more" if len(gaps) > 12 else "")
+                )
+            con.execute(f"DELETE FROM {STATE_TABLE} WHERE state_key = 'status'")
+            con.execute(f"INSERT INTO {STATE_TABLE} VALUES ('status', 'loaded')")
+            state["status"] = "loaded"
+            print(
+                "Recovered a complete staged snapshot from its namespace "
+                "checkpoints; promotion validation may continue."
+            )
+        ready = [t for t in planned if tmp_name(t).lower() in existing]
+        if not ready:
+            raise SystemExit(
+                f"No *_tmp tables found. No tables were changed. Load command: "
+                f"{runner_command('--duckdb-path', duckdb_path)}"
+            )
+
+        snapshot_id = state.get("snapshot_id") or _snapshot_from_tmp(con, ready)
+        if not snapshot_id:
+            raise SystemExit("Could not determine the snapshot id of the *_tmp load; aborting swap.")
+        label = state.get("label") or "tmp refresh"
+
+        # A leftover *_tmp from an older aborted run must never ride along into
+        # production: promote only tmp tables stamped with THIS load's snapshot.
+        vetted: list[str] = []
+        leftovers: list[str] = []
+        for table_name in ready:
+            try:
+                stamped_ids = {
+                    str(row[0])
+                    for row in con.execute(
+                        f"SELECT DISTINCT snapshot_id FROM {quote_ident(tmp_name(table_name))}"
+                    ).fetchall()
+                    if row[0]
+                }
+            except Exception:
+                # No snapshot_id column at all: not staged by this loader.
+                leftovers.append(table_name)
+                continue
+            if stamped_ids == {snapshot_id}:
+                vetted.append(table_name)
+            elif not stamped_ids:
+                # Zero rows carry no snapshot stamp. Trust it only when the
+                # load plan explicitly named the table; an unattributable empty
+                # tmp must not erase a live table.
+                if table_name in selected_state:
+                    vetted.append(table_name)
+                else:
+                    leftovers.append(table_name)
+            elif table_name in selected_state:
+                raise SystemExit(
+                    f"Staged table {tmp_name(table_name)} carries snapshot "
+                    f"{', '.join(sorted(stamped_ids))} but this load is {snapshot_id}; "
+                    "promotion was aborted and no live tables were changed. "
+                    "Re-run the Databa6ix loader to restage it."
+                )
+            else:
+                leftovers.append(table_name)
+        if leftovers:
+            print(
+                "Skipping leftover staged table(s) not part of this load: "
+                + ", ".join(tmp_name(t) for t in leftovers)
+            )
+        ready = vetted
+        if not ready:
+            raise SystemExit(
+                "Every staged *_tmp table belongs to a different load; promotion was "
+                "aborted and no live tables were changed. Re-run the Databa6ix loader."
+            )
+
+        print(f"Swapping {len(ready)} table(s) into production (snapshot {snapshot_id}) ...")
+        con.execute("BEGIN TRANSACTION")
+        try:
+            for table_name in ready:
+                con.execute(f"DROP TABLE IF EXISTS {quote_ident(table_name)}")
+                con.execute(
+                    f"ALTER TABLE {quote_ident(tmp_name(table_name))} RENAME TO {quote_ident(table_name)}"
+                )
+            # Stamp with the swap moment: the app picks its latest snapshot by
+            # captured_at, and promotion is when this data goes live.
+            con.execute(
+                "INSERT OR REPLACE INTO snapshot_runs (snapshot_id, captured_at, label, source) VALUES (?, ?, ?, ?)",
+                [snapshot_id, datetime.now(), label, "runner-tmp-refresh"],
+            )
+            try:
+                stash = con.execute(f"SELECT table_name, sql_text FROM {SQL_STASH_TABLE}").fetchall()
+            except Exception:
+                stash = []
+            for table_name, sql_text in stash:
+                if str(table_name) in ready:
+                    con.execute(
+                        "INSERT OR REPLACE INTO analyzer_source_sql "
+                        "(table_name, snapshot_id, sql_hash, sql_text, recorded_at, source) VALUES (?, ?, ?, ?, ?, ?)",
+                        [str(table_name), snapshot_id, sql_hash(str(sql_text or "")), str(sql_text or ""), datetime.now(), "runner-tmp-refresh"],
+                    )
+            try:
+                registry_rows = con.execute(
+                    "SELECT snapshot_id, namespace_id, cluster_role, cluster_name, cluster_host, "
+                    "primary_database, captured_at FROM _tmp_snapshot_cluster_runs "
+                    "WHERE snapshot_id = ?",
+                    [snapshot_id],
+                ).fetchall()
+            except Exception:
+                registry_rows = []
+            for registry_row in registry_rows:
+                con.execute(
+                    "INSERT OR REPLACE INTO snapshot_cluster_runs "
+                    "(snapshot_id, namespace_id, cluster_role, cluster_name, cluster_host, primary_database, captured_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    list(registry_row),
+                )
+            con.execute(f"DROP TABLE IF EXISTS {STATE_TABLE}")
+            con.execute(f"DROP TABLE IF EXISTS {SQL_STASH_TABLE}")
+            con.execute(f"DROP TABLE IF EXISTS {NAMESPACE_STATE_TABLE}")
+            con.execute("DROP TABLE IF EXISTS _tmp_snapshot_cluster_runs")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+        # Align schemas and rebuild the analyzer's canonical performance
+        # indexes on the freshly renamed tables (renamed tables carry none).
+        for table_name in ready:
+            ensure_table(con, table_name, EXPECTED_COLUMNS.get(table_name, ()))
+        ensure_indexes(con)
+        try:
+            con.execute("CHECKPOINT")
+        except Exception:
+            pass
+
+        print("\nSwap complete. Production tables now hold the new load:")
+        for table_name in ready:
+            rows = con.execute(f"SELECT COUNT(*) FROM {quote_ident(table_name)}").fetchone()[0]
+            print(f"  {table_name}: {int(rows or 0):,} row(s)")
+        indexed = {
+            str(row[0])
+            for row in con.execute("SELECT DISTINCT table_name FROM duckdb_indexes()").fetchall()
+        }
+        print(f"\nIndexes rebuilt: {sum(1 for t in ready if t in indexed)}/{len(ready)} swapped table(s) carry performance indexes.")
+    finally:
+        con.close()
+    return 0
+
+
+# ---------------------------------------------------------------- status mode
+
+
+def run_status(args) -> int:
+    duckdb_path = Path(args.duckdb_path)
+    con = open_duck(duckdb_path, args.lock_wait_seconds)
+    try:
+        state = read_state(con)
+        if state:
+            print(f"Load status: {state.get('status', 'unknown')} (started {state.get('started_at', '?')})")
+            floor_value = state.get("floor_seconds", "?")
+            floor_display = (
+                "per-cluster"
+                if str(floor_value).strip().lower() in {"", "none"}
+                else f"{floor_value}s"
+            )
+            print(
+                f"Window: {state.get('days', '?')} day(s), floor "
+                f"{floor_display} on {state.get('floor_basis', '?')}\n"
+            )
+            planned = tuple(
+                value.strip()
+                for value in str(state.get("selected_tables") or "").split(",")
+                if value.strip()
+            )
+            if planned:
+                completed, required, gaps = staging_checkpoint_progress(
+                    con, state, planned
+                )
+                print(
+                    f"Required dataset checkpoints: {completed}/{required} complete"
+                )
+                if gaps:
+                    print("Missing checkpoints:")
+                    for gap in gaps[:20]:
+                        print(f"  - {gap}")
+                    if len(gaps) > 20:
+                        print(f"  - and {len(gaps) - 20} more")
+                else:
+                    print("Checkpoint validation: complete")
+                print()
+        existing = {
+            str(row[0]).lower()
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+            ).fetchall()
+        }
+        any_tmp = False
+        for table_name in LIVE_REFRESH_TABLES:
+            if (
+                table_name == "external_table_info_all"
+                and not EXTERNAL_CAPTURE_ENABLED
+            ):
+                continue
+            target = tmp_name(table_name)
+            if target.lower() not in existing:
+                print(f"  {target}: not loaded yet")
+                continue
+            any_tmp = True
+            rows = con.execute(f"SELECT COUNT(*) FROM {quote_ident(target)}").fetchone()[0]
+            print(f"  {target}: {int(rows or 0):,} row(s)")
+        if not any_tmp:
+            print(
+                "\nNo staged tables exist. Open DataBa6ix and click Start Safe Load "
+                "on the Data Loader tab."
+            )
+    finally:
+        con.close()
+    return 0
+
+
+# ----------------------------------------------------------------------- main
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Refresh every analyzer DuckDB table through *_tmp duplicates, then swap. Standalone."
+    )
+    parser.add_argument("--duckdb-path", default=None, help="Analyzer DuckDB file (default: analyzer's own location).")
+    parser.add_argument("--days", type=float, default=DEFAULT_DAYS, help=f"Capture window in days (default {DEFAULT_DAYS:g}).")
+    parser.add_argument(
+        "--floor-seconds", type=float, default=None,
+        help=(
+            "Load-wide minimum query runtime override. Default: per-cluster "
+            "(producer 300s, consumers 30s); FLOOR_SECONDS in the cluster "
+            "profiles JSON overrides everything."
+        ),
+    )
+    parser.add_argument("--floor-basis", choices=("execution_time", "elapsed_time"), default="execution_time")
+    parser.add_argument(
+        "--lock-wait-seconds", type=float, default=DEFAULT_LOCK_WAIT_SECONDS,
+        help="How long each short write burst waits for the app to release the DuckDB file.",
+    )
+    parser.add_argument("--resume", action="store_true", help="Continue an interrupted load, skipping tables that already finished.")
+    parser.add_argument("--swap", action="store_true", help="Promote loaded *_tmp tables over the production tables.")
+    parser.add_argument("--status", action="store_true", help="Show *_tmp load progress and exit.")
+    parser.add_argument(
+        "--backup-only", action="store_true",
+        help="Checkpoint and copy the DuckDB file without renaming, deleting, or swapping any tables.",
+    )
+    parser.add_argument("--no-backup", action="store_true", help="Skip the pre-swap backup copy of the DuckDB file.")
+    args = parser.parse_args()
+
+    _load_dotenv_if_present()
+    args.duckdb_path = args.duckdb_path or os.environ.get("REDSHIFT_DUCKDB_PATH") or str(resolve_default_duckdb_path())
+
+    print("== Environment check ==")
+    problems = sense_environment(args)
+    if problems:
+        print("This machine is not ready yet. Fix the following, then run this script again:\n")
+        for number, problem in enumerate(problems, start=1):
+            print(f"  {number}. {problem}")
+        return 2
+    print("  OK - environment ready.\n")
+
+    selected_modes = sum(bool(value) for value in (args.swap, args.status, args.backup_only))
+    if selected_modes > 1:
+        raise SystemExit("Pick exactly one of --swap, --status, or --backup-only.")
+    if args.backup_only:
+        return run_backup_only(args)
+    if args.status:
+        return run_status(args)
+    if args.swap:
+        return run_swap(args)
+    return run_load(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

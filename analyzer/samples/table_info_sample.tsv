@@ -1,0 +1,9 @@
+database	schema	table_id	table	encoded	diststyle	sortkey1	sortkey_num	size	pct_used	empty	unsorted	stats_off	tbl_rows	skew_rows	estimated_visible_rows	risk_event	vacuum_sort_benefit
+tpcds	tpcds	100001	store_sales	Y	KEY(ss_item_sk)	ss_sold_date_sk	1	12400	68.2	0	42.5	18.0	2880404	1.8	2880404	none	14.2
+tpcds	tpcds	100002	customer	Y	EVEN		0	840	72.1	0	5.0	8.0	100000	1.1	100000	none	0
+tpcds	tpcds	100003	date_dim	Y	ALL	d_date_sk	1	60	91.0	0	2.0	1.0	73049	1.0	73049	none	0
+tpcds	tpcds	100004	item	Y	KEY(i_item_sk)	i_category	1	1920	64.3	0	62.0	32.0	204000	5.4	204000	skew	41.0
+tpcds	tpcds	100005	store	Y	ALL	s_store_sk	1	12	88.0	0	0.0	0.5	12	1.0	12	none	0
+tpcds	tpcds	100006	promotion	Y	ALL	p_promo_sk	1	18	82.0	0	1.0	0.0	300	1.0	300	none	0
+tpcds	tpcds	100007	catalog_sales	Y	KEY(cs_item_sk)	cs_sold_date_sk	1	8800	71.0	0	28.0	12.0	1441548	2.4	1441548	none	8.0
+tpcds	tpcds	100008	web_sales	Y	KEY(ws_item_sk)	ws_sold_date_sk	1	4200	66.0	0	35.0	21.0	719384	3.2	719384	skew	11.5

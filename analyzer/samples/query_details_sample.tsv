@@ -1,0 +1,13 @@
+query_id	step_id	stream_id	segment_id	step_name	table_name	schema_name	input_rows	output_rows	input_bytes	elapsed_time	spilled_block_local_disk	spilled_block_remote_disk	data_skewness	time_skewness	alert_type	join_type
+8429113	0	0	0	scan	store_sales	tpcds	2880404	2880404	184345600	420	0	0	0.12	0.08
+8429113	1	0	0	project	store_sales	tpcds	2880404	2880404	184345600	85	0	0	0.05	0.03
+8429113	2	0	0	hash	store_sales	tpcds	2880404	2880404	184345600	260	0	0	0.11	0.09
+8429113	3	0	1	scan	customer	tpcds	100000	100000	8400000	95	0	0	0.04	0.02
+8429113	4	0	1	dist	customer	tpcds	100000	100000	8400000	1840	0	0	0.18	0.22	missing_stats
+8429113	5	0	1	hash join	customer	tpcds	100000	2880404	192745600	3120	640	0	0.34	0.41		inner
+8429113	6	0	2	scan	date_dim	tpcds	73049	73049	6000000	35	0	0	0.02	0.01
+8429113	7	0	2	bcast	date_dim	tpcds	73049	2921960	240000000	1420	220	0	0.09	0.12
+8429113	8	0	2	hash join	store_sales	tpcds	2880404	2880404	192745600	980	0	0	0.14	0.11		inner
+8429113	9	0	3	hash aggregate	store_sales	tpcds	2880404	1240	82320	680	120	0	0.22	0.28	hash_spill
+8429113	10	0	3	sort	store_sales	tpcds	1240	1240	82320	24	0	0	0.01	0.01
+8429113	11	0	3	limit	store_sales	tpcds	1240	100	6640	4	0	0	0.0	0.0

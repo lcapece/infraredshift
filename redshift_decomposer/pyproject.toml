@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redshift-query-decomposer"
+version = "0.2.3"
+description = "Redshift Query Decomposer: compiles a monolithic Amazon Redshift query into a staged, DISTKEY/SORTKEY-tuned pipeline of temp tables - with the reasoning shown."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Louis N. Capece, Jr.", email = "lcapece@optonline.net" }]
+keywords = [
+  "amazon-redshift",
+  "redshift",
+  "sql",
+  "sqlglot",
+  "query-optimization",
+  "query-decomposition",
+  "slow-query",
+  "distkey",
+  "sortkey",
+  "temp-tables",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "sqlglot>=26.0.0,<28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/lcapece/redshift-query-decomposer"
+Repository = "https://github.com/lcapece/redshift-query-decomposer"
+Documentation = "https://github.com/lcapece/redshift-query-decomposer#readme"
+Changelog = "https://github.com/lcapece/redshift-query-decomposer/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

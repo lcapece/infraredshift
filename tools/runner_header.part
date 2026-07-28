@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Standalone zero-downtime refresh of the Redshift analyzer DuckDB tables.
+
+Copy this ONE file anywhere (any folder, any machine) and run it with Python.
+It has no dependency on the analyzer source tree; the capture SQL below is
+bundled verbatim from the analyzer so the loaded data matches a normal
+in-app capture. Requires only:  pip install duckdb pandas redshift-connector
+
+What it does
+------------
+1. LOAD (default):  pulls a window of data from the cluster - 7 days of
+   sys_query_history executions at or above the 10-minute floor - into
+   duplicate tables named `<table>_tmp` (query_history_tmp, ...). The
+   analyzer app can stay open: all slow cluster work happens with the DuckDB
+   file CLOSED, which is only touched in short write bursts (with retry).
+2. SWAP (--swap):   renames every `<table>_tmp` over its production name in
+   one transaction, registers the snapshot, and rebuilds the analyzer's
+   performance indexes. Takes seconds. A file backup is written first.
+
+Usage
+-----
+    python runner.py              # load 7 days of >= 600s queries into *_tmp
+    python runner.py --status     # progress: row counts per *_tmp table
+    python runner.py --resume     # continue an interrupted load
+    python runner.py --backup-only # checkpoint + preserve the DuckDB; change no tables
+    python runner.py --swap       # promote *_tmp -> production tables
+
+Non-secret settings come from environment variables or a .env file next to
+this script. When invoked by DataBasix, connection secrets are supplied from
+the already-unlocked encrypted .secrets session:
+
+    REDSHIFT_HOST=my-cluster.abc123.us-east-1.redshift.amazonaws.com
+    REDSHIFT_PORT=5439                  (optional, default 5439)
+    REDSHIFT_DATABASE=dev               (or REDSHIFT_PRIMARY_DATABASE)
+    REDSHIFT_USER=analyzer_user
+    REDSHIFT_PASSWORD=...               (optional; prompts if missing)
+    REDSHIFT_DUCKDB_PATH=...            (optional; defaults to the analyzer's file)
+    Database-cycled catalog datasets currently use only enterprise_datawarehouse
+    for every enabled cluster under the emergency operating policy.
+
+Multi-cluster profiles (one producer plus any configured consumers):
+
+    REDSHIFT_NAMESPACE=namespace-guid
+    REDSHIFT_ENABLED=true
+    REDSHIFT_FRIENDLY=Business Producer
+    REDSHIFT_PRODUCER_HOST=producer.endpoint
+    REDSHIFT_PRODUCER_DATABASE=dev
+    REDSHIFT_PRODUCER_USER=producer_user
+    REDSHIFT_PRODUCER_PASSWORD=...
+
+    REDSHIFT_CONSUMER_1_NAMESPACE_ID=namespace-guid
+    REDSHIFT_CONSUMER_1_ENABLED=true
+    REDSHIFT_CONSUMER_1_HOST=consumer.endpoint
+    REDSHIFT_CONSUMER_1_DATABASE=dev
+    REDSHIFT_CONSUMER_1_USER=consumer_user
+    REDSHIFT_CONSUMER_1_PASSWORD=...
+
+Repeat CONSUMER_2 and higher as needed. Set a profile's ENABLED value to
+false to keep its configuration while skipping that cluster.
+Legacy REDSHIFT_HOST/USER/etc. remain producer fallbacks.
+
+Note: parent-pattern selection here uses a literal-insensitive text
+fingerprint instead of the app's sqlglot canonicalizer, so the representative
+parent per repeated pattern can occasionally differ from an in-app capture.
+The captured evidence semantics are otherwise identical.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import contextlib
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+MIN_PYTHON = (3, 9)
+
+try:
+    import duckdb
+    import pandas as pd
+except ImportError as _exc:  # sensed in main() with friendly instructions
+    duckdb = None
+    pd = None
+    _IMPORT_ERROR: Exception | None = _exc
+else:
+    _IMPORT_ERROR = None
+
+DEFAULT_DAYS = 7.0
+DEFAULT_FLOOR_SECONDS = 600.0  # 10 minutes
+DEFAULT_REDSHIFT_PORT = 5439
+DEFAULT_LOCK_WAIT_SECONDS = 600
+FETCH_BATCH_ROWS = 25000
+STATE_TABLE = "_tmp_refresh_state"
+SQL_STASH_TABLE = "_tmp_refresh_sql"
+NAMESPACE_STATE_TABLE = "_tmp_namespace_refresh_state"
+ACTIVE_PROFILE_PREFIXES_ENV = "DATABA6IX_ACTIVE_PROFILE_PREFIXES"
+_PROGRESS_HOOK = None
+
+
+def set_progress_hook(hook) -> None:
+    """Install an optional in-application multi-cluster progress callback."""
+    global _PROGRESS_HOOK
+    _PROGRESS_HOOK = hook
+
+
+def emit_progress(namespace_id: str, table_name: str, source_rows: int, duckdb_rows: int, completed: int, total: int, status: str) -> None:
+    hook = _PROGRESS_HOOK
+    if hook is not None:
+        hook(namespace_id, table_name, int(source_rows), int(duckdb_rows), int(completed), int(total), status)
+
+
+def _load_dotenv_if_present() -> None:
+    """Load non-secret identity plus the authenticated in-app secret session."""
+    folders: list[Path] = []
+    launch_dir = str(os.environ.get("REDSHIFT_ANALYZER_LAUNCH_DIR") or "").strip()
+    for folder in (
+        Path(launch_dir).expanduser() if launch_dir else None,
+        Path.cwd(),
+        Path(__file__).resolve().parent,
+    ):
+        if folder is not None and folder not in folders:
+            folders.append(folder)
+    for folder in folders:
+        env_path = folder / ".env"
+        if not env_path.is_file():
+            continue
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        _apply_env_lines(lines)
+        break
+    portable_candidates: list[Path] = []
+    explicit_profile = str(
+        os.environ.get("REDSHIFT_ANALYZER_PROFILE_PATH") or ""
+    ).strip()
+    if explicit_profile:
+        portable_candidates.append(Path(explicit_profile).expanduser())
+    portable_candidates.extend(
+        folder / "redshift_cluster_profiles.json" for folder in folders
+    )
+    for portable_path in dict.fromkeys(portable_candidates):
+        if not portable_path.is_file():
+            continue
+        try:
+            payload = json.loads(portable_path.read_text(encoding="utf-8"))
+            if payload.get("format") != "redshift-query-anatomy-cluster-profiles":
+                raise ValueError("unrecognized portable profile format")
+            allowed = {"enabled", "display_name", "namespace_id", "port", "primary_database", "floor_seconds"}
+            active_prefixes: list[str] = []
+            for profile in payload.get("profiles") or []:
+                prefix = str(profile.get("profile") or "").strip().upper()
+                if prefix != "REDSHIFT_PRODUCER" and not re.fullmatch(r"REDSHIFT_CONSUMER_\d+", prefix):
+                    continue
+                if prefix not in active_prefixes:
+                    active_prefixes.append(prefix)
+                for field in allowed:
+                    if field in profile and profile[field] is not None:
+                        # Portable identity is authoritative. Credentials stay
+                        # in the protected local secret session.
+                        os.environ[f"{prefix}_{field.upper()}"] = str(profile[field])
+            os.environ[ACTIVE_PROFILE_PREFIXES_ENV] = ",".join(active_prefixes)
+            print(f"Loaded portable non-secret cluster profiles from {portable_path}")
+        except Exception as exc:
+            raise SystemExit(f"Could not read {portable_path}: {exc}") from exc
+        break
+    try:
+        from analyzer.secrets_store import (
+            session_secrets,
+            unlock_scheduled_secrets_session,
+        )
+
+        # A direct runner.py launch starts in a fresh process, so the in-memory
+        # credential session is normally empty even after Local Credentials
+        # were saved in the app. Unlock the same-Windows-user DPAPI file here;
+        # keep decrypted values in the protected session rather than exporting
+        # them to child-process-visible environment variables.
+        if not session_secrets():
+            try:
+                unlock_scheduled_secrets_session()
+            except FileNotFoundError:
+                # Legacy standalone deployments may intentionally provide
+                # credentials through their already-established environment.
+                pass
+    except ImportError:
+        # Standalone runner copies without the analyzer package still support
+        # ordinary process environment variables.
+        pass
+
+
+def _apply_env_lines(lines) -> None:
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def default_duckdb_path() -> Path:
+    """Mirror analyzer.duckdb_store.default_duckdb_path without importing it."""
+    base = os.environ.get("REDSHIFT_ANALYZER_HOME")
+    if base:
+        return Path(base) / "redshift.duckdb"
+    return Path.home() / "RQP" / "data" / "redshift.duckdb"
+
+
+def resolve_default_duckdb_path() -> Path:
+    """Find the analyzer's DuckDB file without configuration.
+
+    Search order: the current directory, the folder this script sits in, then
+    the analyzer's own data folder. The app renames its file to
+    redshift.<cluster>.<endpoint-key>.duckdb once a source cluster is
+    configured, so any *.duckdb file counts as a candidate. Auto-pick when a
+    folder holds exactly one; list the choices when there are several."""
+    searched = []
+    script_dir = Path(__file__).resolve().parent
+    for folder in dict.fromkeys((Path.cwd(), script_dir, default_duckdb_path().parent)):
+        if not folder.is_dir():
+            continue
+        candidates = sorted(folder.glob("*.duckdb"))
+        if len(candidates) == 1:
+            print(f"Using DuckDB file found in {folder}: {candidates[0].name}\n")
+            return candidates[0]
+        if len(candidates) > 1:
+            print(f"Multiple DuckDB files exist in {folder} - pass --duckdb-path (or set REDSHIFT_DUCKDB_PATH) to pick one:")
+            for candidate in candidates:
+                print(f"  {candidate.name}")
+            print()
+            return default_duckdb_path()
+        searched.append(str(folder))
+    if searched:
+        print("No *.duckdb file found in: " + "; ".join(searched))
+    return default_duckdb_path()
+
+
+# =============================================================================
+# SECTION 1 - capture SQL, bundled VERBATIM from analyzer/redshift_queries.py.
+# Regenerate with tools/make_runner.py after changing the analyzer's SQL.
+# =============================================================================
