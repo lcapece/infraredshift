@@ -203,15 +203,12 @@ def main() -> int:
     print(f"   parsed {len(texts):,} queries in {total:.1f}s")
     if slow:
         slow.sort(reverse=True)
-        print(f"
-   {len(slow)} query(s) took over 1s. Worst:")
+        print(f"\n{len(slow)} query(s) took over 1s. Worst:")
         for cost, qid, snippet in slow[:5]:
             print(f"     {cost:>7.1f}s  query {qid}: {snippet}")
-        print("
-   These are what stall the grouping pass.")
+        print("\nThese are what stall the grouping pass.")
 
-    print("
-   Running the full grouping diagnostic...")
+    print("\nRunning the full grouping diagnostic...")
     try:
         diagnostics = module.diagnose_repeat_query_candidates(frame)
     except Exception as exc:

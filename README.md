@@ -206,6 +206,17 @@ Infraredshift loads every cluster into one DuckDB file, attributes each query to
 its namespace, then groups **across** clusters. That is what makes an
 estate-wide answer possible.
 
+### One cluster works just as well
+
+None of this *requires* a datashare estate. A single Redshift cluster is simply
+treated as the producer: configure one profile, leave the consumer entries out,
+and everything works the same way — the same grouping, the same heat map, the
+same ranked fixes. The Load Status screen shows that one cluster under its
+friendly name rather than pretending there is a topology.
+
+The producer/consumer material above describes where the tool earns the most,
+not what it needs to run.
+
 ### The 80/20 becomes a 98/2
 
 The familiar rule of thumb is that ~80% of slowness comes from ~20% of queries.
