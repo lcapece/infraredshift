@@ -189,6 +189,40 @@ class _SortableTreeItem(QTreeWidgetItem):
         return self.text(column).strip().lower() < other.text(column).strip().lower()
 
 
+def _collapse_label(captured: int, patterns: int) -> str:
+    """"13,232 → 68" — both sides, because the ratio is the point.
+
+    A bare pattern count means nothing without the number it came from: 68
+    patterns is unremarkable until you know it accounts for 13,232 queries.
+    """
+    captured = max(0, int(captured))
+    patterns = max(0, int(patterns))
+    if not patterns:
+        return "-"
+    return f"{captured:,} → {patterns:,}"
+
+
+def _collapse_tooltip(captured: int, patterns: int) -> str:
+    captured = max(0, int(captured))
+    patterns = max(0, int(patterns))
+    if not patterns:
+        return "No repeat patterns have been grouped yet."
+    lines = [
+        f"{captured:,} captured slow queries grouped into {patterns:,} "
+        f"repeating pattern(s).",
+    ]
+    if captured > patterns:
+        # State the reduction as a plain fraction. A "99.5% reduction" reads as
+        # a marketing number; "1 pattern per 195 queries" is checkable.
+        lines.append(
+            f"Roughly 1 pattern per {captured / patterns:,.0f} captured queries."
+        )
+        lines.append(
+            "Fixing one pattern addresses every query that shares its shape."
+        )
+    return "\n".join(lines)
+
+
 def _fmt_duration(seconds: object) -> str:
     try:
         value = float(seconds)
@@ -1727,12 +1761,17 @@ class TriagePage(QWidget):
         tiles = QHBoxLayout(tile_strip)
         tiles.setContentsMargins(2, 2, 2, 4)
         tiles.setSpacing(0)
+        # The headline number: thousands of "distinct" slow queries collapse to
+        # a few dozen shapes. That ratio is the whole argument for the tool, so
+        # it goes first and states both sides rather than a bare count.
+        self._tile_collapse = _Tile("Slow queries → patterns")
         self._tile_patterns = _Tile("Parent patterns")
         self._tile_runs = _Tile("Repeated runs")
         self._tile_runtime = _Tile("Repeat runtime")
         self._tile_share = _Tile("Share of slow runtime")
         self._tile_tables = _Tile("Tables flagged")
         for tile in (
+            self._tile_collapse,
             self._tile_patterns,
             self._tile_runs,
             self._tile_runtime,
@@ -2452,6 +2491,7 @@ class TriagePage(QWidget):
         groups = self._groups
         if groups is None or groups.empty:
             for tile in (
+                self._tile_collapse,
                 self._tile_patterns,
                 self._tile_runs,
                 self._tile_runtime,
@@ -2463,6 +2503,14 @@ class TriagePage(QWidget):
         runs = _numeric_column(groups, "query_count").sum()
         runtime = _numeric_column(groups, "total_runtime_s").sum()
         flagged = _numeric_column(groups, "triage_tables_flagged").sum()
+        # Prefer the captured slow-query count from the load summary. Fall back
+        # to the summed run count, which is the number of queries these
+        # patterns actually account for - never invent a denominator.
+        captured = int(summary.get("slow_query_count") or 0)
+        if captured <= 0:
+            captured = int(runs)
+        self._tile_collapse.set_value(_collapse_label(captured, len(groups)))
+        self._tile_collapse.setToolTip(_collapse_tooltip(captured, len(groups)))
         self._tile_patterns.set_value(f"{len(groups):,}")
         self._tile_runs.set_value(f"{int(runs):,}")
         self._tile_runtime.set_value(_fmt_duration(runtime))
