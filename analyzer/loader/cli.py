@@ -75,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     external.add_argument("--json-events", action="store_true")
 
     roster = subparsers.add_parser(
-        "user-roster", help="Refresh the persistent parsed PG_USER roster (producer)"
+        "user-roster", help="Load the parsed SVV_USER_INFO roster (producer)"
     )
     roster.add_argument("--duckdb-path", default=None)
     roster.add_argument("--json-events", action="store_true")

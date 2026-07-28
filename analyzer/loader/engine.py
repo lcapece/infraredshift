@@ -602,6 +602,23 @@ def build_external_catalog_command(
     return command
 
 
+def roster_command(
+    duckdb_path: str,
+    *,
+    python_executable: str | None = None,
+) -> list[str]:
+    """Command that loads ONLY the SVV_USER_INFO roster.
+
+    Kept separate from build_loader_command: the roster is a small user list
+    that changes rarely, and wanting it should not require a full workload
+    capture.
+    """
+    command = [*_loader_entry_command(python_executable), "user-roster"]
+    command.extend(("--duckdb-path", str(duckdb_path)))
+    command.append("--json-events")
+    return command
+
+
 def printable_loader_command(request: LoaderRequest) -> str:
     command = build_loader_command(request)
     return subprocess_list2cmdline(command) if os.name == "nt" else shlex.join(command)

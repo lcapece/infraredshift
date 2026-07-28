@@ -576,7 +576,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--refresh-user-roster",
         action="store_true",
-        help="Reload only the parsed SVV_USER_INFO roster (producer, enterprise_data_warehouse) and exit.",
+        help="Reload only the parsed SVV_USER_INFO roster (producer) and exit.",
+    )
+    parser.add_argument(
+        "--roster-database",
+        default="",
+        help=(
+            "Database to read SVV_USER_INFO from. The view is cluster-wide, so "
+            "any reachable database works; this only matters when the defaults "
+            "are not present on your cluster."
+        ),
     )
     parser.add_argument(
         "--external-catalog-timeout",
@@ -1294,13 +1303,45 @@ def capture_user_roster(
     from .redshift_queries import USER_ROSTER_SQL
     from .user_roster import build_user_roster
 
-    print(f"Capturing user roster from SVV_USER_INFO on {ENTERPRISE_DW_DATABASE} (producer)")
-    frame = fetch_frame(
-        args, ENTERPRISE_DW_DATABASE, user, password, USER_ROSTER_SQL, jdbc_url, jars,
-        stage=f"user_roster [{ENTERPRISE_DW_DATABASE}]",
-    )
+    # SVV_USER_INFO is cluster-wide, so ANY reachable database returns the same
+    # roster. The historical hard-coded enterprise_data_warehouse is tried
+    # first, then the configured primary database - a cluster without that
+    # exact database name would otherwise return nothing at all, silently.
+    candidates: list[str] = []
+    for name in (
+        str(getattr(args, "roster_database", "") or "").strip(),
+        ENTERPRISE_DW_DATABASE,
+        str(getattr(args, "database", "") or "").strip(),
+        os.environ.get("REDSHIFT_PRODUCER_DATABASE", "").strip(),
+        "dev",
+    ):
+        if name and name not in candidates:
+            candidates.append(name)
+
+    frame = pd.DataFrame()
+    used = ""
+    for database in candidates:
+        print(f"Capturing user roster from SVV_USER_INFO on {database} (producer)")
+        try:
+            frame = fetch_frame(
+                args, database, user, password, USER_ROSTER_SQL, jdbc_url, jars,
+                stage=f"user_roster [{database}]",
+            )
+        except Exception as exc:
+            print(f"  {database}: unavailable ({exc}); trying the next database")
+            continue
+        if frame is not None and not frame.empty:
+            used = database
+            break
+        print(f"  {database}: 0 rows; trying the next database")
+
+    if frame is None or frame.empty:
+        print(
+            "  No user roster rows were returned from any database. "
+            "Check that this user can SELECT from SVV_USER_INFO."
+        )
     roster = build_user_roster(frame)
-    print(f"  parsed {len(roster):,} user(s)")
+    print(f"  parsed {len(roster):,} user(s)" + (f" from {used}" if used else ""))
     _replace_capture_preserving_existing(duck, store, "user_roster", roster, run)
     store.record_source_sql(duck, "user_roster", run, USER_ROSTER_SQL)
 
