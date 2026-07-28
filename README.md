@@ -496,7 +496,7 @@ network call, no model.
 
 ```bash
 pip install infraredshift          # add [redshift] for live capture
-python -m analyzer
+python -m infraredshift
 ```
 
 Python 3.10+. Full onboarding — profiles, credentials, first load — is in
