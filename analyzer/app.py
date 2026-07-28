@@ -33,6 +33,7 @@ from .widgets.recommendations import Recommendations
 from .widgets.step_timeline import StepTimeline
 from .widgets.table_diagnostics import TableDiagnostics
 from .widgets.query_decomposer import QueryDecomposerPage
+from .widgets.table_insights import TableInsightsPage
 from .widgets.title_bar import TitleBar
 from .widgets.sql_annotations import SqlAnnotationContextFilter
 from .widgets.topology import TopologyPage
@@ -222,6 +223,14 @@ class MainWindow(QMainWindow):
         self._table_heatmap_tab = self._tabs.addTab(
             _scroll_guard(self._table_heatmap),
             "Table Heat Map",
+        )
+        self._table_insights = TableInsightsPage()
+        self._table_insights_tab = self._tabs.addTab(
+            _scroll_guard(self._table_insights),
+            "Critical Table Insights",
+        )
+        self._table_insights.loadRequested.connect(
+            lambda area: self._cluster._request_area_load(area)
         )
         self._action_plan = self._cluster.action_plan_page()
         self._action_plan_tab = self._tabs.addTab(
@@ -414,6 +423,10 @@ class MainWindow(QMainWindow):
             _step(
                 "Single Query Analysis",
                 lambda: self._single_query.set_cluster_report(report),
+            )
+            _step(
+                "Critical Table Insights",
+                lambda: self._table_insights.set_report(report),
             )
             self._title.update_cluster_metrics(report.summary, report.rule_count)
         except Exception as exc:
