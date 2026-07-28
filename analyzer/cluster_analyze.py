@@ -787,7 +787,12 @@ LIMIT 1
             floor_clause, floor_params = _namespace_floor_filter()
             slow_queries = fetch_df(
                 "Repeating Queries",
-                _repeating_slow_queries_sql(where, floor_clause, _slow_query_view_columns(con)),
+                _repeating_slow_queries_sql(
+                    where,
+                    floor_clause,
+                    _slow_query_view_columns(con),
+                    min_runs=max(2, int(settings.repeat_min_group_size or 3)),
+                ),
                 params + floor_params,
             )
             if floor_params:
@@ -1409,13 +1414,23 @@ def _slow_query_view_columns(con) -> set[str]:
         return set()
 
 
-def _repeating_slow_queries_sql(where: str, floor_clause: str, columns: set[str]) -> str:
+def _repeating_slow_queries_sql(
+    where: str,
+    floor_clause: str,
+    columns: set[str],
+    min_runs: int = 3,
+) -> str:
     """Repeat-only workload selection, computed entirely inside DuckDB.
 
     A query survives only when it repeats: identical normalized SQL from any
     user, the same user with matching leading/trailing characters, or the
     same SYS query hash when a hash column is captured. One-off queries are
     dropped here so they never reach the Python/sqlglot analysis stages.
+
+    ``min_runs`` is how many times a query must recur to count as repeating.
+    It is applied HERE rather than only at grouping time: this pre-filter runs
+    before any SQL is parsed, so a query dropped here never reaches grouping
+    at all. Raising the setting without raising this would change nothing.
 
     generic_query_hash is preferred: SYS_QUERY_HISTORY computes it over the
     normalized statement with literals stripped, so parameterized repeats
@@ -1435,7 +1450,7 @@ def _repeating_slow_queries_sql(where: str, floor_clause: str, columns: set[str]
         )
         hash_predicate = (
             f" OR (NULLIF(TRIM(CAST({hash_key} AS VARCHAR)), '') IS NOT NULL "
-            "AND _hash_repeats > 1)"
+            f"AND _hash_repeats >= {min_runs})"
         )
         hash_exclude = ", _hash_repeats"
     return f"""
@@ -1466,11 +1481,11 @@ counted AS (
 SELECT * EXCLUDE (_norm_sql, _exact_repeats, _shape_repeats{hash_exclude})
 FROM counted
 WHERE _norm_sql <> ''
-  AND (_exact_repeats > 1
+  AND (_exact_repeats >= {min_runs}
        -- The affix-shape rule means "the SAME user repeating a pattern";
        -- blank/NULL users all share one pseudo-user, so for them the loose
        -- first/last-64-char match must not count as a repeat on its own.
-       OR (_shape_repeats > 1
+       OR (_shape_repeats >= {min_runs}
            AND NULLIF(TRIM(CAST(user_name AS VARCHAR)), '') IS NOT NULL){hash_predicate})
 ORDER BY risk_score DESC NULLS LAST, elapsed_s DESC NULLS LAST
 """

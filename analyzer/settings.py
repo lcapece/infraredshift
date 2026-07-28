@@ -18,7 +18,11 @@ DEFAULT_DATABASE_MIN_QUERY_COUNT = 250
 DEFAULT_REPEAT_SIMILARITY_THRESHOLD = 0.78
 DEFAULT_REPEAT_PREFILTER_THRESHOLD = 0.30
 DEFAULT_REPEAT_FUZZY_MERGE_THRESHOLD = 0.95
-DEFAULT_REPEAT_MIN_GROUP_SIZE = 2
+# How many times a query must recur before it counts as a repeating pattern.
+# 3 rather than 2: two runs of the same shape in a week is often coincidence,
+# three is a habit - a schedule, a dashboard, or a job. Adjustable in
+# Settings -> Query Grouping; the minimum is 2 because one run cannot repeat.
+DEFAULT_REPEAT_MIN_GROUP_SIZE = 3
 DEFAULT_CAPTURE_QUERY_LIMIT = 0
 DEFAULT_CAPTURE_RANK_BY = "elapsed_time"
 DEFAULT_ROOT_MIN_EXECUTION_SECONDS = 30

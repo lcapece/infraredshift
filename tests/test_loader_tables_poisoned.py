@@ -4,6 +4,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.cluster_analyze import load_cluster_report
+from analyzer.settings import save_settings, load_settings
 from analyzer.duckdb_store import DuckDBStore
 
 
@@ -63,6 +64,11 @@ def test_varchar_loader_grouping_tables_cannot_crash_or_blank_the_load(tmp_path,
     con.execute('CREATE OR REPLACE TABLE "loader_repeat_members" AS SELECT * FROM m')
     con.close()
 
+    # The fixture pairs each query exactly twice; pin the repeat threshold to
+    # 2 so this test measures poisoned-table handling, not the product default.
+    settings = load_settings()
+    settings.repeat_min_group_size = 2
+    save_settings(settings)
     report = load_cluster_report(path, snapshot_id=run.snapshot_id, areas=["repeat_queries"])
 
     assert not report.slow_queries.empty
@@ -89,6 +95,11 @@ def test_empty_loader_grouping_tables_fall_through_to_fresh_grouping(tmp_path, m
     )
     con.close()
 
+    # The fixture pairs each query exactly twice; pin the repeat threshold to
+    # 2 so this test measures poisoned-table handling, not the product default.
+    settings = load_settings()
+    settings.repeat_min_group_size = 2
+    save_settings(settings)
     report = load_cluster_report(path, snapshot_id=run.snapshot_id, areas=["repeat_queries"])
 
     assert not report.slow_queries.empty
