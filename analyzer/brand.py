@@ -64,7 +64,11 @@ LEGACY_APP_STATE_FOLDERS = (
     "Databasix",
 )
 
-# Legacy corporate DuckDB location components (~/RQP/data).
+# Where the DuckDB warehouse lives, under the user profile.
+# ~/Infraredshift/data for a new install; ~/RQP/data is still adopted when it
+# already holds a warehouse, so an existing corporate deployment keeps its
+# captured data without being told to move anything.
+DATA_PARTS = ("Infraredshift", "data")
 LEGACY_DATA_PARTS = ("RQP", "data")
 
 PORTABLE_PROFILE_FILENAME = "redshift_cluster_profiles.json"

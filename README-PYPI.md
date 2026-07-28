@@ -35,17 +35,23 @@ pip install "infraredshift[jdbc]"
 
 Python 3.10+.
 
-**No executables are installed.** The wheel is pure Python (`py3-none-any`) and
-contains no `.exe`, `.dll` or compiled extension of any kind. Deliberately, it
-also installs no console-script shims — on Windows pip generates those as
-`.exe` files (the same mechanism behind `pip.exe`), drops them in a directory
-that is often not on `PATH`, and warns about it. On a locked-down laptop an
-unexplained `.exe` is a question you have to answer, so there are none.
-
-Everything runs as a module:
+After installing, run it with either:
 
 ```bash
-python -m analyzer                  # the desktop app
+infraredshift              # the command pip put on your PATH
+python -m infraredshift    # identical, and needs no PATH entry
+```
+
+**Nothing here is compiled.** The wheel is pure Python (`py3-none-any`) and
+contains no `.exe`, `.dll` or binary extension. On Windows pip generates small
+`.exe` launchers for the commands above — the same mechanism behind `pip.exe`
+— and may warn that it placed them in a directory not on your `PATH`. That
+warning is about your PATH, not the package; `python -m infraredshift` works
+regardless.
+
+The loader and capture tools are available the same way:
+
+```bash
 python -m analyzer.loader           # the loader CLI
 python -m analyzer.ingest_redshift  # direct capture
 ```
@@ -55,7 +61,7 @@ python -m analyzer.ingest_redshift  # direct capture
 ## First run
 
 ```bash
-python -m analyzer
+python -m infraredshift
 ```
 
 The app opens on a local sign-in screen. **This is not a Redshift login** — it

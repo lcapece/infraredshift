@@ -18,6 +18,7 @@ from typing import Iterable
 from .brand import (
     APP_STATE_FOLDER,
     LEGACY_APP_STATE_FOLDERS,
+    DATA_PARTS,
     LEGACY_DATA_PARTS,
     PORTABLE_PROFILE_FILENAME,
     PRODUCT_NAME,
@@ -140,7 +141,12 @@ def resolve_runtime_paths(
         # Preserve the historical REDSHIFT_ANALYZER_HOME contract.
         data = analyzer_home
     else:
-        data = Path.home().resolve().joinpath(*LEGACY_DATA_PARTS)
+        # Prefer the legacy folder when it already holds a warehouse: an
+        # existing install must not silently start reading a new, empty
+        # location and look like it lost every captured row.
+        home = Path.home().resolve()
+        legacy = home.joinpath(*LEGACY_DATA_PARTS)
+        data = legacy if (legacy / "redshift.duckdb").is_file() else home.joinpath(*DATA_PARTS)
 
     configured_duckdb = _environment_path("REDSHIFT_DUCKDB_PATH", env, relative_to=install)
     duckdb_file = configured_duckdb or data / "redshift.duckdb"
