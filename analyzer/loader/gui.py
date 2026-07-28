@@ -44,7 +44,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..brand import PRODUCT_NAME, PRODUCT_NAME_UPPER
-from .engine import LoaderRequest, build_loader_command, build_promote_command, printable_loader_command
+from .engine import (
+    LoaderRequest,
+    build_loader_command,
+    build_promote_command,
+    printable_loader_command,
+    roster_command,
+)
 
 _EVENT_PREFIX = "INFRAREDSHIFT_EVENT "
 _STATE_TABLE = "_tmp_refresh_state"
@@ -427,6 +433,15 @@ class LoaderWindow(QWidget):
         technical.clicked.connect(
             lambda: self._log.setVisible(not self._log.isVisible())
         )
+        self._roster = QPushButton("Load User Roster")
+        self._roster.setProperty("class", "LoaderQuiet")
+        self._roster.setToolTip(
+            "Read SVV_USER_INFO from the producer and store the parsed user "
+            "roster. Small and quick - it is a user list, not workload data. "
+            "The roster is what lets Assign to Engineer and Email User resolve "
+            "real names and addresses."
+        )
+        self._roster.clicked.connect(self._load_user_roster)
         schedule = QPushButton("Copy nightly schedule command")
         schedule.setProperty("class", "LoaderQuiet")
         schedule.clicked.connect(self._copy_schedule_command)
@@ -438,6 +453,7 @@ class LoaderWindow(QWidget):
         primary_actions.addWidget(self._promote)
         primary_actions.addStretch(1)
         secondary_actions.addWidget(technical)
+        secondary_actions.addWidget(self._roster)
         secondary_actions.addStretch(1)
         secondary_actions.addWidget(schedule)
         secondary_actions.addWidget(close)
@@ -935,6 +951,32 @@ class LoaderWindow(QWidget):
             operation="promote",
         )
 
+    def _load_user_roster(self) -> None:
+        """Load only the SVV_USER_INFO roster.
+
+        Separate from a workload load on purpose: the roster is a small user
+        list that changes rarely, and needing it should not mean waiting for a
+        full capture. It is also the only way to populate the roster from the
+        UI - previously the app told users to "refresh the User Roster in the
+        Data Loader" when the Data Loader had no such control.
+        """
+        if self._running():
+            QMessageBox.information(
+                self,
+                "Load User Roster",
+                "A load is already running. Wait for it to finish, then try again.",
+            )
+            return
+        path = self._path.text().strip()
+        if not path:
+            QMessageBox.information(
+                self, "Load User Roster", "Choose a DuckDB file first."
+            )
+            return
+        command = roster_command(path)
+        self._append_log("Loading the user roster from SVV_USER_INFO (producer).")
+        self._start_process(command, operation="roster")
+
     def _copy_schedule_command(self) -> None:
         request = LoaderRequest(
             duckdb_path=self._path.text().strip(),
@@ -978,7 +1020,11 @@ class LoaderWindow(QWidget):
         self._primary.setText("Cancel Load")
         self._set_cancel_mode(True)
         self._status.setText(
-            "Collecting cluster data…" if operation == "refresh" else "Promoting staged snapshot…"
+            {
+                "refresh": "Collecting cluster data…",
+                "promote": "Promoting staged snapshot…",
+                "roster": "Reading the user roster from SVV_USER_INFO…",
+            }.get(operation, "Working…")
         )
         self._status_detail.setText("The load runs in its own process; this window stays responsive.")
         self._append_log("$ " + " ".join(command))
@@ -1036,7 +1082,14 @@ class LoaderWindow(QWidget):
             for line in detail[-6:]:
                 self._append_log(line)
             return
-        if operation == "promote":
+        if operation == "roster":
+            self._status.setText("User roster loaded.")
+            self._status_detail.setText(
+                "Assign to Engineer and Email User can now resolve names and "
+                "addresses from the roster."
+            )
+            self._progress.setValue(100)
+        elif operation == "promote":
             self._status.setText("Promotion complete — the staged snapshot is now live.")
             self._status_detail.setText("Open the analyzer to explore the refreshed data.")
         elif self._auto_promote.isChecked():
