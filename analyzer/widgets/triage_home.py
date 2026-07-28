@@ -12,8 +12,9 @@ import re
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
+    QDesktopServices,
     QColor,
     QFont,
     QPainter,
@@ -2275,8 +2276,13 @@ class TriagePage(QWidget):
         clear_assoc_action = (
             menu.addAction("Clear user association") if associated else None
         )
+        menu.addSeparator()
+        email_action = menu.addAction("Email User…")
         chosen = menu.exec(global_pos)
         if chosen is None:
+            return
+        if chosen is email_action:
+            self._email_group_user(group)
             return
         if chosen is assign_action:
             self._assign_group(group)
@@ -2422,6 +2428,118 @@ class TriagePage(QWidget):
                 data["associated_user_name"] = user_name
                 item.setData(0, _GROUP_ROLE, data)
                 break
+
+    def _group_user_candidates(self, group: dict) -> list[str]:
+        """Users seen running this pattern, most frequent first.
+
+        Members carry the per-query user; the group's own ``users`` column is
+        a pre-joined summary and may read "Multiple Users", so it is only a
+        fallback.
+        """
+        key = _text(group.get("repeat_group_key"))
+        group_id = _text(group.get("repeat_group_id"))
+        members = self._members
+        if members is not None and not members.empty and "user_name" in members.columns:
+            mine = members
+            if "repeat_group_key" in members.columns and key:
+                mine = members[members["repeat_group_key"].astype(str) == key]
+            if mine.empty and "repeat_group_id" in members.columns and group_id:
+                mine = members[members["repeat_group_id"].astype(str) == group_id]
+            if not mine.empty:
+                counts = mine["user_name"].dropna().astype(str).str.strip()
+                counts = counts[counts != ""]
+                if not counts.empty:
+                    return list(counts.value_counts().index)
+        raw = _text(group.get("users"))
+        if raw and raw.lower() != "multiple users":
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return []
+
+    def _email_group_user(self, group: dict) -> None:
+        """Open a mail client addressed to the user behind this pattern."""
+        from ..user_email import (
+            build_body,
+            build_mailto,
+            build_subject,
+            resolve_recipient,
+        )
+
+        candidates = self._group_user_candidates(group)
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Email User",
+                "No user was captured for this query pattern, so there is "
+                "nobody to write to.",
+            )
+            return
+
+        roster = self._load_roster_frame()
+        resolved = [
+            (name, resolve_recipient(name, roster)[0]) for name in candidates
+        ]
+        addressable = [(name, email) for name, email in resolved if email]
+
+        if not addressable:
+            # The normal case for service accounts, so explain rather than
+            # guessing a domain - a wrong address emails a real stranger.
+            shown = ", ".join(name for name, _ in resolved[:5])
+            QMessageBox.information(
+                self,
+                "Email User",
+                f"This pattern runs as {shown}.\n\n"
+                "That is not an email address, and the captured user roster "
+                "does not map it to one - it is most likely a service or "
+                "application account rather than a person.\n\n"
+                "Find out who owns that account, then use "
+                "“Associate Query to User…” to record it.",
+            )
+            return
+
+        name, email = addressable[0]
+        sql = (
+            _text(group.get("sample_sql"))
+            or _text(group.get("representative_sql"))
+            or _text(group.get("sql_shape"))
+        )
+        subject = build_subject(group)
+        body = build_body(
+            group,
+            display_name=name,
+            sender=_text(getattr(self, "_sender_name", "")),
+            sql=sql,
+        )
+        url = build_mailto(email, subject, body)
+
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(
+                self,
+                "Email User",
+                "Could not open your mail client. The message is on the "
+                "clipboard instead.",
+            )
+            QApplication.clipboard().setText(f"To: {email}\nSubject: {subject}\n\n{body}")
+
+    def _load_roster_frame(self):
+        """Captured user roster, or an empty frame when none is loaded."""
+        import pandas as _pd
+
+        if not self._db_path:
+            return _pd.DataFrame()
+        try:
+            import duckdb
+
+            con = duckdb.connect(str(self._db_path), read_only=True)
+        except Exception:
+            return _pd.DataFrame()
+        try:
+            return con.execute(
+                "SELECT user_name, email FROM user_roster"
+            ).df()
+        except Exception:
+            return _pd.DataFrame()
+        finally:
+            con.close()
 
     def _export_user_associations(self) -> None:
         """Write the ownership handoff document."""
