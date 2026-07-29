@@ -4000,7 +4000,60 @@ class _ConfigDialog(QDialog):
 
         self._scope_by_user_box.toggled.connect(self._save_scope_by_user)
         layout.addWidget(card)
+
+        runs_card = QFrame()
+        runs_card.setObjectName("CardSubtle")
+        runs_body = QVBoxLayout(runs_card)
+        runs_body.setContentsMargins(12, 10, 12, 10)
+        runs_body.setSpacing(8)
+        runs_title = QLabel("WHAT COUNTS AS REPEATING")
+        runs_title.setObjectName("SectionHeader")
+        runs_body.addWidget(runs_title)
+
+        runs_row = QHBoxLayout()
+        runs_row.addWidget(QLabel("Minimum runs in the capture window"))
+        self._min_runs = QSpinBox()
+        self._min_runs.setRange(2, 1000)
+        self._min_runs.setValue(max(2, int(getattr(settings, "repeat_min_group_size", 3) or 3)))
+        self._min_runs.setToolTip(
+            "How many times a query shape must recur before it is treated as a "
+            "repeating pattern worth analysing."
+        )
+        runs_row.addWidget(self._min_runs)
+        runs_row.addStretch(1)
+        runs_body.addLayout(runs_row)
+
+        runs_explain = QLabel(
+            "Default 3. Two runs of the same shape in a week is often "
+            "coincidence; three is a habit - a schedule, a dashboard, or a job. "
+            "The minimum is 2, because a query that ran once cannot repeat.\n\n"
+            "Raising this shows fewer, more certain patterns. Lowering it "
+            "widens the net and admits more noise."
+        )
+        runs_explain.setObjectName("Caption")
+        runs_explain.setWordWrap(True)
+        runs_body.addWidget(runs_explain)
+
+        runs_warning = QLabel(
+            "This filter runs inside DuckDB before any SQL is parsed, so "
+            "changing it discards the cached grouping and forces a full "
+            "regroup on the next analysis load."
+        )
+        runs_warning.setObjectName("Caption")
+        runs_warning.setWordWrap(True)
+        runs_warning.setStyleSheet(f"color:{PALETTE.warn}; font-weight:700;")
+        runs_body.addWidget(runs_warning)
+
+        self._min_runs.valueChanged.connect(self._save_min_runs)
+        layout.addWidget(runs_card)
         layout.addStretch(1)
+
+    def _save_min_runs(self, value: int) -> None:
+        settings = load_settings()
+        if int(getattr(settings, "repeat_min_group_size", 3) or 3) == int(value):
+            return
+        settings.repeat_min_group_size = max(2, int(value))
+        save_settings(settings)
 
     def _save_scope_by_user(self, checked: bool) -> None:
         settings = load_settings()
