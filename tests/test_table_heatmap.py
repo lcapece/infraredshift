@@ -384,12 +384,14 @@ def test_table_heatmap_is_the_fourth_top_level_tab(monkeypatch, tmp_path) -> Non
         "Data Loader",
         "Workload Triage",
         "Table Heat Map",
+        "Critical Table Insights",
         "Fix Queue",
         "Single Query Analysis",
     ]
     assert window._table_heatmap_tab == 3
-    assert window._action_plan_tab == 4
-    assert window._single_query_tab == 5
+    assert window._table_insights_tab == 4
+    assert window._action_plan_tab == 5
+    assert window._single_query_tab == 6
     # The Fix Queue page was built and fed data but never mounted, so the
     # triage screen pointed at a tab that did not exist.
     assert window._action_plan is window._cluster.action_plan_page()
